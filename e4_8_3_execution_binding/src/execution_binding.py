@@ -14,6 +14,7 @@ from pathlib import Path
 import sqlite3
 import time
 from typing import Any, Callable, Mapping
+from enum import Enum
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
@@ -291,6 +292,101 @@ class ToolRequest:
     context: Mapping[str, Any]
 
 
+class ToolLookupStatus(str, Enum):
+    NOT_FOUND = "NOT_FOUND"
+    IN_PROGRESS = "IN_PROGRESS"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED_NO_EFFECT = "FAILED_NO_EFFECT"
+    UNKNOWN = "UNKNOWN"
+
+
+@dataclass(frozen=True)
+class ToolCapabilities:
+    """Declared provider capabilities; declarations are adapter claims, not proofs."""
+
+    naturally_idempotent: bool = False
+    supports_idempotency_key: bool = False
+    supports_authoritative_lookup: bool = False
+    idempotency_scope: str | None = None
+    idempotency_retention_seconds: int | None = None
+
+    def __post_init__(self) -> None:
+        for name in (
+            "naturally_idempotent",
+            "supports_idempotency_key",
+            "supports_authoritative_lookup",
+        ):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"{name} must be bool")
+
+        if self.idempotency_scope is not None:
+            if not isinstance(self.idempotency_scope, str) or not self.idempotency_scope.strip():
+                raise ValueError("idempotency_scope must be a non-empty string")
+
+        if self.idempotency_retention_seconds is not None:
+            if (not isinstance(self.idempotency_retention_seconds, int)
+                    or isinstance(self.idempotency_retention_seconds, bool)
+                    or self.idempotency_retention_seconds <= 0):
+                raise ValueError("idempotency_retention_seconds must be a positive integer")
+
+        if self.idempotency_retention_seconds is not None and not self.supports_idempotency_key:
+            raise ValueError("retention requires supports_idempotency_key=True")
+
+
+@dataclass(frozen=True)
+class ToolLookupResult:
+    """Provider lookup result bound to one exact operation and request."""
+
+    status: ToolLookupStatus
+    operation_id: str
+    request_digest: str
+    result: Mapping[str, Any] | None = None
+    authoritative: bool = False
+
+
+def coerce_tool_lookup_result(
+    raw: Any, *, operation_id: str, request_digest: str
+) -> ToolLookupResult:
+    """Normalize lookup responses without guessing that absence means no effect."""
+    if isinstance(raw, ToolLookupResult):
+        normalized = raw
+    elif raw is None:
+        normalized = ToolLookupResult(
+            ToolLookupStatus.UNKNOWN,
+            operation_id,
+            request_digest,
+            authoritative=False,
+        )
+    elif isinstance(raw, Mapping):
+        # Legacy positive results are useful for compatibility, but are not
+        # authoritative unless the adapter explicitly declares that capability.
+        normalized = ToolLookupResult(
+            ToolLookupStatus.SUCCEEDED,
+            operation_id,
+            request_digest,
+            result=dict(raw),
+            authoritative=False,
+        )
+    else:
+        raise ExecutionIndeterminate("tool lookup returned an unsupported response type")
+
+    if normalized.operation_id != operation_id:
+        raise ExecutionIndeterminate("tool lookup operation_id does not match the request")
+    if normalized.request_digest != request_digest:
+        raise ExecutionIndeterminate("tool lookup request_digest does not match the request")
+    if not isinstance(normalized.status, ToolLookupStatus):
+        raise ExecutionIndeterminate("tool lookup returned an invalid status")
+    if normalized.status == ToolLookupStatus.SUCCEEDED:
+        if not isinstance(normalized.result, Mapping):
+            raise ExecutionIndeterminate("SUCCEEDED lookup omitted a mapping result")
+    elif normalized.result is not None:
+        raise ExecutionIndeterminate("non-SUCCEEDED lookup unexpectedly included a result")
+    if not isinstance(normalized.authoritative, bool):
+        raise ExecutionIndeterminate("tool lookup authoritative flag must be bool")
+
+    return normalized
+
+
 class ToolAdapter:
     """Adapter contract; concrete tools must expose trusted schema and idempotency.
 
@@ -303,6 +399,14 @@ class ToolAdapter:
     tool_name: str
     schema_hash: str
     idempotent_by_operation_id: bool
+
+    @property
+    def capabilities(self) -> ToolCapabilities:
+        return ToolCapabilities(
+            supports_idempotency_key=bool(
+                getattr(self, "idempotent_by_operation_id", False)
+            )
+        )
 
     def execute(
         self,
@@ -326,6 +430,14 @@ class SQLiteIdempotentTool(ToolAdapter):
     """
 
     idempotent_by_operation_id = True
+
+    @property
+    def capabilities(self) -> ToolCapabilities:
+        return ToolCapabilities(
+            supports_idempotency_key=True,
+            supports_authoritative_lookup=True,
+            idempotency_scope="tool-service-database",
+        )
 
     def __init__(self, *, tool_name: str, schema: Mapping[str, Any], database_path: str | Path) -> None:
         self.tool_name = tool_name
@@ -370,17 +482,28 @@ class SQLiteIdempotentTool(ToolAdapter):
             con.commit()
         return result
 
-    def lookup(self, *, operation_id: str, request_digest: str) -> Mapping[str, Any] | None:
+    def lookup(self, *, operation_id: str, request_digest: str) -> ToolLookupResult:
         with self._db() as con:
             row = con.execute(
                 "SELECT request_digest,result_json FROM tool_effects WHERE operation_id=?",
                 (operation_id,),
             ).fetchone()
         if row is None:
-            return None
+            return ToolLookupResult(
+                ToolLookupStatus.NOT_FOUND,
+                operation_id,
+                request_digest,
+                authoritative=True,
+            )
         if row[0] != request_digest:
             raise ToolOperationConflict("tool operation_id is bound to another request")
-        return json.loads(row[1])
+        return ToolLookupResult(
+            ToolLookupStatus.SUCCEEDED,
+            operation_id,
+            request_digest,
+            result=json.loads(row[1]),
+            authoritative=True,
+        )
 
     def effect_count(self) -> int:
         with self._db() as con:
@@ -751,16 +874,53 @@ class ExecutionBindingGateway:
             if existing["status"] != "DISPATCHING":
                 raise ExecutionIndeterminate(f"unexpected gateway state: {existing['status']}")
 
-            # A positive durable lookup can recover the effect without invoking the tool again.
-            result = tool.lookup(operation_id=request.operation_id, request_digest=request_digest)
-            if result is None:
-                # A first dispatch is safe to invoke once. After a restart, a
-                # persisted DISPATCHING row is ambiguous unless the tool offers
-                # durable lookup or operation_id idempotency.
-                if not tool.idempotent_by_operation_id and not dispatch_started_now:
+            # Recovery decisions use explicit provider states.
+            raw_lookup = tool.lookup(
+                operation_id=request.operation_id,
+                request_digest=request_digest,
+            )
+            lookup = coerce_tool_lookup_result(
+                raw_lookup,
+                operation_id=request.operation_id,
+                request_digest=request_digest,
+            )
+
+            capabilities = tool.capabilities
+            if not isinstance(capabilities, ToolCapabilities):
+                raise ExecutionIndeterminate("tool capabilities contract is invalid")
+
+            legacy_idempotent = bool(
+                getattr(tool, "idempotent_by_operation_id", False)
+            )
+            idempotent_retry_allowed = (
+                capabilities.naturally_idempotent
+                or capabilities.supports_idempotency_key
+                or legacy_idempotent
+            )
+            authoritative_lookup = (
+                lookup.authoritative
+                and capabilities.supports_authoritative_lookup
+            )
+
+            if lookup.status == ToolLookupStatus.SUCCEEDED:
+                if not authoritative_lookup:
                     self.journal.set_status(request.operation_id, "INDETERMINATE")
                     raise ExecutionIndeterminate(
-                        "tool is not idempotent by operation_id and no durable result can be queried"
+                        "SUCCEEDED lookup lacks a declared authoritative lookup capability"
+                    )
+                result = dict(lookup.result)
+
+            elif lookup.status == ToolLookupStatus.IN_PROGRESS:
+                # Keep DISPATCHING unresolved; do not launch a concurrent duplicate.
+                raise ExecutionIndeterminate(
+                    "tool operation is still in progress; recovery must wait"
+                )
+
+            elif lookup.status == ToolLookupStatus.NOT_FOUND:
+                if not authoritative_lookup and not dispatch_started_now:
+                    self.journal.set_status(request.operation_id, "INDETERMINATE")
+                    raise ExecutionIndeterminate(
+                        "non-authoritative NOT_FOUND cannot justify recovery dispatch"
                     )
                 result = tool.execute(
                     operation_id=request.operation_id,
@@ -770,6 +930,40 @@ class ExecutionBindingGateway:
                 )
                 if crash_at == "after_tool_effect":
                     raise InjectedCrash("crash after tool returned its effect but before receipt commit")
+
+            elif lookup.status == ToolLookupStatus.FAILED_NO_EFFECT:
+                if not authoritative_lookup:
+                    self.journal.set_status(request.operation_id, "INDETERMINATE")
+                    raise ExecutionIndeterminate(
+                        "FAILED_NO_EFFECT requires declared authoritative evidence"
+                    )
+                result = tool.execute(
+                    operation_id=request.operation_id,
+                    request_digest=request_digest,
+                    arguments=request.arguments,
+                    context=request.context,
+                )
+                if crash_at == "after_tool_effect":
+                    raise InjectedCrash("crash after tool returned its effect but before receipt commit")
+
+            elif lookup.status == ToolLookupStatus.UNKNOWN:
+                if not dispatch_started_now and not idempotent_retry_allowed:
+                    self.journal.set_status(request.operation_id, "INDETERMINATE")
+                    raise ExecutionIndeterminate(
+                        "tool state is UNKNOWN and no safe idempotent retry contract is available"
+                    )
+                result = tool.execute(
+                    operation_id=request.operation_id,
+                    request_digest=request_digest,
+                    arguments=request.arguments,
+                    context=request.context,
+                )
+                if crash_at == "after_tool_effect":
+                    raise InjectedCrash("crash after tool returned its effect but before receipt commit")
+
+            else:
+                self.journal.set_status(request.operation_id, "INDETERMINATE")
+                raise ExecutionIndeterminate("unsupported tool lookup state")
 
             receipt = self._make_receipt(grant, request, tool, context_digest_value,
                                          request_digest, int(existing["budget_counter_value"]), result)

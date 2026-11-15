@@ -53,6 +53,51 @@ class NonIdempotentTool(ToolAdapter):
         return None
 
 
+
+
+class D63ScriptedLookupTool(NonIdempotentTool):
+    """Test adapter with a caller-controlled provider lookup response."""
+
+    def __init__(
+        self,
+        *,
+        status,
+        authoritative=False,
+        declares_authoritative=False,
+        supports_idempotency_key=False,
+        result=None,
+    ):
+        super().__init__()
+        from src.execution_binding import (
+            ToolCapabilities,
+            ToolLookupResult,
+        )
+
+        self._status = status
+        self._authoritative = authoritative
+        self._declares_authoritative = declares_authoritative
+        self._supports_idempotency_key = supports_idempotency_key
+        self._lookup_result = result
+        self._ToolCapabilities = ToolCapabilities
+        self._ToolLookupResult = ToolLookupResult
+
+    @property
+    def capabilities(self):
+        return self._ToolCapabilities(
+            naturally_idempotent=False,
+            supports_idempotency_key=self._supports_idempotency_key,
+            supports_authoritative_lookup=self._declares_authoritative,
+        )
+
+    def lookup(self, *, operation_id, request_digest):
+        return self._ToolLookupResult(
+            status=self._status,
+            operation_id=operation_id,
+            request_digest=request_digest,
+            result=self._lookup_result,
+            authoritative=self._authoritative,
+        )
+
 class ExecutionBindingTests(unittest.TestCase):
     NOW = 1_800_000_000
     CONTEXT = {"tenant_id": "tenant-A", "session_id": "session-9", "purpose": "invoice-review"}
@@ -461,6 +506,254 @@ class ExecutionBindingTests(unittest.TestCase):
         self.assertEqual(non_idempotent.effects, 1)
         self.assertEqual(restarted.broker.counter.read(), 1)
 
+
+    def _d63_make_send_message_case(
+        self,
+        *,
+        status,
+        authoritative=False,
+        declares_authoritative=False,
+        supports_idempotency_key=False,
+        result=None,
+    ):
+        from src.execution_binding import ToolLookupStatus
+
+        # Each scenario gets independent journal, broker and counter files.
+        # This prevents one subTest's INDETERMINATE state from contaminating
+        # the next subTest.
+        case_tmp = tempfile.TemporaryDirectory(prefix="d63-case-")
+        self.addCleanup(case_tmp.cleanup)
+
+        previous_root = self.root
+        self.root = Path(case_tmp.name)
+        try:
+            tool = D63ScriptedLookupTool(
+                status=status,
+                authoritative=authoritative,
+                declares_authoritative=declares_authoritative,
+                supports_idempotency_key=supports_idempotency_key,
+                result=result,
+            )
+            request = ToolRequest(
+                operation_id="op-d63",
+                subject_id="agent-17",
+                tool_name="send_message",
+                arguments={"recipient": "user-1", "body": "hello"},
+                context=dict(self.CONTEXT),
+            )
+            grant = self.make_grant(
+                quota=5,
+                allowed_tool_name="send_message",
+                allowed_schema_hash=tool.schema_hash,
+            )
+            gateway = self.make_gateway(tool)
+        finally:
+            self.root = previous_root
+
+        return tool, request, grant, gateway, ToolLookupStatus
+
+    def _d63_crash_before_tool_call(self, gateway, grant, request):
+        with self.assertRaises(InjectedCrash):
+            gateway.execute(grant, request, crash_at="after_dispatch_intent")
+
+    def test_d63_recovery_lookup_state_matrix(self):
+        from src.execution_binding import ToolLookupStatus
+
+        # Recovery must fail closed for ambiguous or non-authoritative states.
+        rejected_cases = [
+            (
+                "in_progress",
+                ToolLookupStatus.IN_PROGRESS,
+                True,
+                True,
+                False,
+            ),
+            (
+                "non_authoritative_not_found",
+                ToolLookupStatus.NOT_FOUND,
+                False,
+                True,
+                False,
+            ),
+            (
+                "undeclared_authoritative_failed_no_effect",
+                ToolLookupStatus.FAILED_NO_EFFECT,
+                True,
+                False,
+                False,
+            ),
+            (
+                "unknown_without_idempotency",
+                ToolLookupStatus.UNKNOWN,
+                False,
+                False,
+                False,
+            ),
+        ]
+
+        for (
+            label,
+            status,
+            authoritative,
+            declares_authoritative,
+            supports_idempotency_key,
+        ) in rejected_cases:
+            with self.subTest(case=label):
+                tool, request, grant, gateway, _ = self._d63_make_send_message_case(
+                    status=status,
+                    authoritative=authoritative,
+                    declares_authoritative=declares_authoritative,
+                    supports_idempotency_key=supports_idempotency_key,
+                )
+
+                self._d63_crash_before_tool_call(gateway, grant, request)
+                restarted = self.make_gateway(tool)
+
+                with self.assertRaises(ExecutionIndeterminate):
+                    restarted.execute(grant, request)
+
+                self.assertEqual(tool.effects, 0)
+                self.assertEqual(restarted.broker.counter.read(), 1)
+
+    def test_d63_authoritative_not_found_allows_one_recovery_dispatch(self):
+        from src.execution_binding import ToolLookupStatus
+
+        tool, request, grant, gateway, _ = self._d63_make_send_message_case(
+            status=ToolLookupStatus.NOT_FOUND,
+            authoritative=True,
+            declares_authoritative=True,
+        )
+        self._d63_crash_before_tool_call(gateway, grant, request)
+
+        restarted = self.make_gateway(tool)
+        outcome = restarted.execute(grant, request)
+
+        self.assertEqual(tool.effects, 1)
+        self.assertEqual(restarted.broker.counter.read(), 1)
+        self.assertTrue(verify_execution_receipt(
+            outcome.receipt, restarted.gateway_public_key
+        ))
+
+    def test_d63_authoritative_failed_no_effect_allows_one_recovery_dispatch(self):
+        from src.execution_binding import ToolLookupStatus
+
+        tool, request, grant, gateway, _ = self._d63_make_send_message_case(
+            status=ToolLookupStatus.FAILED_NO_EFFECT,
+            authoritative=True,
+            declares_authoritative=True,
+        )
+        self._d63_crash_before_tool_call(gateway, grant, request)
+
+        restarted = self.make_gateway(tool)
+        outcome = restarted.execute(grant, request)
+
+        self.assertEqual(tool.effects, 1)
+        self.assertEqual(restarted.broker.counter.read(), 1)
+        self.assertTrue(verify_execution_receipt(
+            outcome.receipt, restarted.gateway_public_key
+        ))
+
+    def test_d63_authoritative_succeeded_recovers_without_redispatch(self):
+        from src.execution_binding import ToolLookupStatus
+
+        recovered_result = {
+            "sent": True,
+            "effect_number": 1,
+            "recipient": "user-1",
+        }
+        tool, request, grant, gateway, _ = self._d63_make_send_message_case(
+            status=ToolLookupStatus.SUCCEEDED,
+            authoritative=True,
+            declares_authoritative=True,
+            result=recovered_result,
+        )
+        self._d63_crash_before_tool_call(gateway, grant, request)
+
+        restarted = self.make_gateway(tool)
+        outcome = restarted.execute(grant, request)
+
+        self.assertEqual(tool.effects, 0)
+        self.assertEqual(outcome.receipt["payload"]["result"], recovered_result)
+        self.assertEqual(restarted.broker.counter.read(), 1)
+        self.assertTrue(verify_execution_receipt(
+            outcome.receipt, restarted.gateway_public_key
+        ))
+
+    def test_d63_unknown_with_idempotency_key_allows_recovery_retry(self):
+        from src.execution_binding import ToolLookupStatus
+
+        tool, request, grant, gateway, _ = self._d63_make_send_message_case(
+            status=ToolLookupStatus.UNKNOWN,
+            supports_idempotency_key=True,
+        )
+        self._d63_crash_before_tool_call(gateway, grant, request)
+
+        restarted = self.make_gateway(tool)
+        restarted.execute(grant, request)
+
+        self.assertEqual(tool.effects, 1)
+        self.assertEqual(restarted.broker.counter.read(), 1)
+
+    def test_d63_first_dispatch_allows_non_authoritative_not_found(self):
+        from src.execution_binding import ToolLookupStatus
+
+        tool, request, grant, gateway, _ = self._d63_make_send_message_case(
+            status=ToolLookupStatus.NOT_FOUND,
+            authoritative=False,
+            declares_authoritative=False,
+        )
+
+        # This is the first dispatch, not recovery after an uncertain call.
+        gateway.execute(grant, request)
+
+        self.assertEqual(tool.effects, 1)
+        self.assertEqual(gateway.broker.counter.read(), 1)
+
+    def test_d63_lookup_binding_mismatch_never_dispatches(self):
+        from src.execution_binding import (
+            ToolLookupResult,
+            ToolLookupStatus,
+        )
+
+        for mismatch in ("operation_id", "request_digest"):
+            with self.subTest(mismatch=mismatch):
+                tool, request, grant, gateway, _ = self._d63_make_send_message_case(
+                    status=ToolLookupStatus.NOT_FOUND,
+                    authoritative=True,
+                    declares_authoritative=True,
+                )
+
+                # First create a durable DISPATCHING record.
+                self._d63_crash_before_tool_call(gateway, grant, request)
+
+                original_lookup = tool.lookup
+
+                def mismatched_lookup(*, operation_id, request_digest):
+                    return ToolLookupResult(
+                        status=ToolLookupStatus.NOT_FOUND,
+                        operation_id=(
+                            "different-operation"
+                            if mismatch == "operation_id"
+                            else operation_id
+                        ),
+                        request_digest=(
+                            "different-digest"
+                            if mismatch == "request_digest"
+                            else request_digest
+                        ),
+                        authoritative=True,
+                    )
+
+                tool.lookup = mismatched_lookup
+                restarted = self.make_gateway(tool)
+
+                with self.assertRaises(ExecutionIndeterminate):
+                    restarted.execute(grant, request)
+
+                self.assertEqual(tool.effects, 0)
+                self.assertEqual(restarted.broker.counter.read(), 1)
+                tool.lookup = original_lookup
+
     def test_unresolved_operation_blocks_new_operation_until_recovery(self):
         with self.assertRaises(InjectedCrash):
             self.gateway.execute(self.grant, self.request, crash_at="after_dispatch_intent")
@@ -530,6 +823,86 @@ print(json.dumps(outcome.receipt, sort_keys=True))
         self.assertEqual(outputs[0], outputs[1])
         self.assertEqual(self.tool.effect_count(), 1)
         self.assertEqual(self.gateway.broker.counter.read(), 1)
+
+    def test_d62_structured_lookup_states_and_binding_validation(self):
+        from src.execution_binding import (
+            ToolLookupStatus,
+            ToolLookupResult,
+            ToolCapabilities,
+            coerce_tool_lookup_result,
+        )
+
+        unknown = coerce_tool_lookup_result(
+            None, operation_id="op-x", request_digest="digest-x"
+        )
+        self.assertEqual(unknown.status, ToolLookupStatus.UNKNOWN)
+        self.assertFalse(unknown.authoritative)
+
+        legacy_positive = coerce_tool_lookup_result(
+            {"ok": True}, operation_id="op-x", request_digest="digest-x"
+        )
+        self.assertEqual(legacy_positive.status, ToolLookupStatus.SUCCEEDED)
+        self.assertFalse(legacy_positive.authoritative)
+
+        not_found = ToolLookupResult(
+            ToolLookupStatus.NOT_FOUND, "op-x", "digest-x", authoritative=True
+        )
+        self.assertEqual(
+            coerce_tool_lookup_result(
+                not_found, operation_id="op-x", request_digest="digest-x"
+            ).status,
+            ToolLookupStatus.NOT_FOUND,
+        )
+
+        with self.assertRaises(ExecutionIndeterminate):
+            coerce_tool_lookup_result(
+                ToolLookupResult(
+                    ToolLookupStatus.NOT_FOUND, "other-op", "digest-x",
+                    authoritative=True,
+                ),
+                operation_id="op-x",
+                request_digest="digest-x",
+            )
+
+        with self.assertRaises(ExecutionIndeterminate):
+            coerce_tool_lookup_result(
+                ToolLookupResult(
+                    ToolLookupStatus.NOT_FOUND, "op-x", "other-digest",
+                    authoritative=True,
+                ),
+                operation_id="op-x",
+                request_digest="digest-x",
+            )
+
+        with self.assertRaises(ValueError):
+            ToolCapabilities(
+                supports_idempotency_key=False,
+                idempotency_retention_seconds=60,
+            )
+
+    def test_d62_sqlite_lookup_reports_authoritative_not_found_and_success(self):
+        from src.execution_binding import ToolLookupStatus
+
+        absent = self.tool.lookup(
+            operation_id="not-yet-executed",
+            request_digest="sha256:" + "a" * 64,
+        )
+        self.assertEqual(absent.status, ToolLookupStatus.NOT_FOUND)
+        self.assertTrue(absent.authoritative)
+
+        self.tool.execute(
+            operation_id="lookup-existing",
+            request_digest="sha256:" + "b" * 64,
+            arguments={"invoice_id": "INV-LOOKUP", "decision": "approve"},
+            context=dict(self.CONTEXT),
+        )
+        found = self.tool.lookup(
+            operation_id="lookup-existing",
+            request_digest="sha256:" + "b" * 64,
+        )
+        self.assertEqual(found.status, ToolLookupStatus.SUCCEEDED)
+        self.assertTrue(found.authoritative)
+        self.assertEqual(found.result["operation_id"], "lookup-existing")
 
     def test_quota_exhaustion_does_not_invoke_second_tool_or_increment(self):
         grant_one = self.make_grant(quota=1)
