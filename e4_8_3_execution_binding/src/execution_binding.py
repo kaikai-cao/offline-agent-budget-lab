@@ -302,7 +302,13 @@ class ToolLookupStatus(str, Enum):
 
 @dataclass(frozen=True)
 class ToolCapabilities:
-    """Declared provider capabilities; declarations are adapter claims, not proofs."""
+    """Declared provider capabilities; declarations are adapter claims, not proofs.
+
+    A positive idempotency_retention_seconds value is measured from the first
+    durable dispatch intent. None explicitly declares that the idempotency key
+    does not expire. It must not be used when a real provider's retention is
+    unknown.
+    """
 
     naturally_idempotent: bool = False
     supports_idempotency_key: bool = False
@@ -552,6 +558,7 @@ class ExecutionJournal:
                 "request_digest TEXT NOT NULL, status TEXT NOT NULL, budget_counter_value INTEGER, "
                 "receipt_json TEXT, parent_authorization_digest TEXT NOT NULL DEFAULT '', "
                 "parent_authorization_nonce TEXT NOT NULL DEFAULT '', "
+                "dispatch_started_at INTEGER, "
                 "updated_utc TEXT NOT NULL DEFAULT "
                 "(strftime('%Y-%m-%dT%H:%M:%fZ','now')))"
             )
@@ -569,6 +576,10 @@ class ExecutionJournal:
                     "ALTER TABLE executions ADD COLUMN "
                     "parent_authorization_nonce TEXT NOT NULL DEFAULT ''"
                 )
+            if "dispatch_started_at" not in columns:
+                con.execute(
+                    "ALTER TABLE executions ADD COLUMN dispatch_started_at INTEGER"
+                )
             con.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS ux_executions_parent_nonce "
                 "ON executions(parent_authorization_nonce) "
@@ -585,7 +596,7 @@ class ExecutionJournal:
             row = con.execute(
                 "SELECT operation_id,grant_digest,grant_id,lease_id,subject_id,tool_name,"
                 "schema_hash,context_digest,request_digest,status,budget_counter_value,receipt_json,"
-                "parent_authorization_digest,parent_authorization_nonce "
+                "parent_authorization_digest,parent_authorization_nonce,dispatch_started_at "
                 "FROM executions WHERE operation_id=?", (operation_id,)
             ).fetchone()
         if row is None:
@@ -593,7 +604,7 @@ class ExecutionJournal:
         keys = ("operation_id", "grant_digest", "grant_id", "lease_id", "subject_id",
                 "tool_name", "schema_hash", "context_digest", "request_digest", "status",
                 "budget_counter_value", "receipt_json", "parent_authorization_digest",
-                "parent_authorization_nonce")
+                "parent_authorization_nonce", "dispatch_started_at")
         return dict(zip(keys, row))
 
     def unresolved_other_than(self, operation_id: str) -> list[str]:
@@ -651,13 +662,16 @@ class ExecutionJournal:
             )
             con.commit()
 
-    def set_dispatching(self, operation_id: str) -> None:
+    def set_dispatching(self, operation_id: str, dispatch_started_at: int) -> None:
+        if not isinstance(dispatch_started_at, int) or isinstance(dispatch_started_at, bool):
+            raise ValueError("dispatch_started_at must be an integer Unix timestamp")
         with _ClosingConnection(self.path) as con:
             con.execute("BEGIN IMMEDIATE")
             con.execute(
                 "UPDATE executions SET status='DISPATCHING', "
+                "dispatch_started_at=COALESCE(dispatch_started_at, ?), "
                 "updated_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE operation_id=?",
-                (operation_id,),
+                (dispatch_started_at, operation_id),
             )
             con.commit()
 
@@ -865,7 +879,7 @@ class ExecutionBindingGateway:
 
             dispatch_started_now = False
             if existing["status"] == "BUDGET_CONSUMED":
-                self.journal.set_dispatching(request.operation_id)
+                self.journal.set_dispatching(request.operation_id, int(self.clock()))
                 existing = self.journal.get(request.operation_id)
                 dispatch_started_now = True
                 if crash_at == "after_dispatch_intent":
@@ -947,11 +961,35 @@ class ExecutionBindingGateway:
                     raise InjectedCrash("crash after tool returned its effect but before receipt commit")
 
             elif lookup.status == ToolLookupStatus.UNKNOWN:
-                if not dispatch_started_now and not idempotent_retry_allowed:
-                    self.journal.set_status(request.operation_id, "INDETERMINATE")
-                    raise ExecutionIndeterminate(
-                        "tool state is UNKNOWN and no safe idempotent retry contract is available"
+                if not dispatch_started_now:
+                    # Natural idempotence is independent of key retention.
+                    retry_safe = (
+                        capabilities.naturally_idempotent or legacy_idempotent
                     )
+
+                    if capabilities.supports_idempotency_key:
+                        retention = capabilities.idempotency_retention_seconds
+                        if retention is None:
+                            # None is an explicit non-expiring-key declaration.
+                            retry_safe = True
+                        else:
+                            started_at = existing.get("dispatch_started_at")
+                            now = int(self.clock())
+                            key_retry_safe = (
+                                started_at is not None
+                                and now >= started_at
+                                and now - started_at < retention
+                            )
+                            # Natural idempotence is independently sufficient.
+                            retry_safe = retry_safe or key_retry_safe
+
+                    if not retry_safe:
+                        self.journal.set_status(request.operation_id, "INDETERMINATE")
+                        raise ExecutionIndeterminate(
+                            "tool state is UNKNOWN and the idempotency retry contract "
+                            "is absent, expired, or cannot be safely established"
+                        )
+
                 result = tool.execute(
                     operation_id=request.operation_id,
                     request_digest=request_digest,

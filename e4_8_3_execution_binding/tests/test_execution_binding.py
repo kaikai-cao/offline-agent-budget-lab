@@ -66,6 +66,8 @@ class D63ScriptedLookupTool(NonIdempotentTool):
         declares_authoritative=False,
         supports_idempotency_key=False,
         result=None,
+        retention_seconds=None,
+        naturally_idempotent=False,
     ):
         super().__init__()
         from src.execution_binding import (
@@ -77,6 +79,8 @@ class D63ScriptedLookupTool(NonIdempotentTool):
         self._authoritative = authoritative
         self._declares_authoritative = declares_authoritative
         self._supports_idempotency_key = supports_idempotency_key
+        self._retention_seconds = retention_seconds
+        self._naturally_idempotent = naturally_idempotent
         self._lookup_result = result
         self._ToolCapabilities = ToolCapabilities
         self._ToolLookupResult = ToolLookupResult
@@ -84,9 +88,10 @@ class D63ScriptedLookupTool(NonIdempotentTool):
     @property
     def capabilities(self):
         return self._ToolCapabilities(
-            naturally_idempotent=False,
+            naturally_idempotent=self._naturally_idempotent,
             supports_idempotency_key=self._supports_idempotency_key,
             supports_authoritative_lookup=self._declares_authoritative,
+            idempotency_retention_seconds=self._retention_seconds,
         )
 
     def lookup(self, *, operation_id, request_digest):
@@ -930,6 +935,230 @@ print(json.dumps(outcome.receipt, sort_keys=True))
                 gateway.execute(grant_one, second_request)
             self.assertEqual(broker.counter.read(), 1)
             self.assertEqual(tool.effect_count(), 1)
+
+
+    def _d71_gateway_at(self, root, tool, clock):
+        broker = DurableCounterBroker(
+            journal_path=root / "budget-journal.sqlite3",
+            counter_state_path=root / "counter.json",
+            broker_lock_path=root / "broker.lock",
+            lease_id="lease-offline-17",
+            quota_limit=5,
+        )
+        return ExecutionBindingGateway(
+            issuer_public_key=self.issuer_private.public_key(),
+            gateway_private_key=self.gateway_private,
+            gateway_id="gateway-lab-1",
+            broker=broker,
+            journal_path=root / "execution-journal.sqlite3",
+            lock_path=root / "gateway.lock",
+            tools={tool.tool_name: tool},
+            clock=clock,
+        )
+
+    def _d71_case(self, *, retention_seconds=10, naturally_idempotent=False):
+        from src.execution_binding import ToolLookupStatus
+
+        tmp = tempfile.TemporaryDirectory(prefix="d71-case-")
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+
+        tool = D63ScriptedLookupTool(
+            status=ToolLookupStatus.UNKNOWN,
+            supports_idempotency_key=True,
+            retention_seconds=retention_seconds,
+            naturally_idempotent=naturally_idempotent,
+        )
+
+        request = ToolRequest(
+            operation_id="op-d71",
+            subject_id="agent-17",
+            tool_name="send_message",
+            arguments={"recipient": "user-1", "body": "hello"},
+            context=dict(self.CONTEXT),
+        )
+        grant = self.make_grant(
+            quota=5,
+            allowed_tool_name="send_message",
+            allowed_schema_hash=tool.schema_hash,
+        )
+
+        now = [self.NOW]
+        clock = lambda: now[0]
+        gateway = self._d71_gateway_at(root, tool, clock)
+
+        with self.assertRaises(InjectedCrash):
+            gateway.execute(grant, request, crash_at="after_dispatch_intent")
+
+        return root, tool, request, grant, gateway, now
+
+    def test_d71_unknown_retry_inside_retention_window(self):
+        root, tool, request, grant, gateway, now = self._d71_case(
+            retention_seconds=10
+        )
+        now[0] += 9
+        restarted = self._d71_gateway_at(root, tool, lambda: now[0])
+        restarted.execute(grant, request)
+        self.assertEqual(tool.effects, 1)
+        self.assertEqual(restarted.broker.counter.read(), 1)
+
+    def test_d71_exact_retention_expiry_is_rejected(self):
+        root, tool, request, grant, gateway, now = self._d71_case(
+            retention_seconds=10
+        )
+        now[0] += 10
+        restarted = self._d71_gateway_at(root, tool, lambda: now[0])
+        with self.assertRaises(ExecutionIndeterminate):
+            restarted.execute(grant, request)
+        self.assertEqual(tool.effects, 0)
+        self.assertEqual(restarted.broker.counter.read(), 1)
+        self.assertEqual(
+            restarted.journal.get(request.operation_id)["status"],
+            "INDETERMINATE",
+        )
+
+    def test_d71_expired_retention_is_rejected(self):
+        root, tool, request, grant, gateway, now = self._d71_case(
+            retention_seconds=10
+        )
+        now[0] += 11
+        restarted = self._d71_gateway_at(root, tool, lambda: now[0])
+        with self.assertRaises(ExecutionIndeterminate):
+            restarted.execute(grant, request)
+        self.assertEqual(tool.effects, 0)
+        self.assertEqual(restarted.broker.counter.read(), 1)
+
+    def test_d71_missing_dispatch_timestamp_is_rejected(self):
+        root, tool, request, grant, gateway, now = self._d71_case(
+            retention_seconds=10
+        )
+        con = sqlite3.connect(root / "execution-journal.sqlite3")
+        try:
+            con.execute(
+                "UPDATE executions SET dispatch_started_at=NULL WHERE operation_id=?",
+                (request.operation_id,),
+            )
+            con.commit()
+        finally:
+            con.close()
+        restarted = self._d71_gateway_at(root, tool, lambda: now[0] + 1)
+        with self.assertRaises(ExecutionIndeterminate):
+            restarted.execute(grant, request)
+        self.assertEqual(tool.effects, 0)
+        self.assertEqual(restarted.broker.counter.read(), 1)
+
+    def test_d71_clock_rollback_is_rejected(self):
+        root, tool, request, grant, gateway, now = self._d71_case(
+            retention_seconds=10
+        )
+        restarted = self._d71_gateway_at(root, tool, lambda: now[0] - 1)
+        with self.assertRaises(ExecutionIndeterminate):
+            restarted.execute(grant, request)
+        self.assertEqual(tool.effects, 0)
+        self.assertEqual(restarted.broker.counter.read(), 1)
+
+    def test_d71_non_expiring_key_declaration_allows_recovery(self):
+        root, tool, request, grant, gateway, now = self._d71_case(
+            retention_seconds=None
+        )
+        # Remain inside the signed grant validity interval.
+        now[0] += 3500
+        restarted = self._d71_gateway_at(root, tool, lambda: now[0])
+        restarted.execute(grant, request)
+        self.assertEqual(tool.effects, 1)
+        self.assertEqual(restarted.broker.counter.read(), 1)
+
+    def test_d71_natural_idempotence_ignores_key_expiry(self):
+        root, tool, request, grant, gateway, now = self._d71_case(
+            retention_seconds=1,
+            naturally_idempotent=True,
+        )
+        now[0] += 100
+        restarted = self._d71_gateway_at(root, tool, lambda: now[0])
+        restarted.execute(grant, request)
+        self.assertEqual(tool.effects, 1)
+        self.assertEqual(restarted.broker.counter.read(), 1)
+
+    def test_d71_first_dispatch_is_not_blocked_by_retention_guard(self):
+        from src.execution_binding import ToolLookupStatus
+
+        tmp = tempfile.TemporaryDirectory(prefix="d71-first-")
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        tool = D63ScriptedLookupTool(
+            status=ToolLookupStatus.UNKNOWN,
+            supports_idempotency_key=True,
+            retention_seconds=1,
+        )
+        request = ToolRequest(
+            operation_id="op-d71-first",
+            subject_id="agent-17",
+            tool_name="send_message",
+            arguments={"recipient": "user-1", "body": "hello"},
+            context=dict(self.CONTEXT),
+        )
+        grant = self.make_grant(
+            quota=5,
+            allowed_tool_name="send_message",
+            allowed_schema_hash=tool.schema_hash,
+        )
+        gateway = self._d71_gateway_at(root, tool, lambda: self.NOW)
+        gateway.execute(grant, request)
+        self.assertEqual(tool.effects, 1)
+        self.assertEqual(gateway.broker.counter.read(), 1)
+
+    def test_d71_dispatch_timestamp_is_not_overwritten(self):
+        root, tool, request, grant, gateway, now = self._d71_case(
+            retention_seconds=10
+        )
+        original = gateway.journal.get(request.operation_id)["dispatch_started_at"]
+        gateway.journal.set_dispatching(request.operation_id, self.NOW + 5)
+        self.assertEqual(
+            gateway.journal.get(request.operation_id)["dispatch_started_at"],
+            original,
+        )
+
+    def test_d71_additive_migration_preserves_existing_rows(self):
+        tmp = tempfile.TemporaryDirectory(prefix="d71-migration-")
+        self.addCleanup(tmp.cleanup)
+        db = Path(tmp.name) / "legacy-journal.sqlite3"
+
+        con = sqlite3.connect(db)
+        try:
+            con.execute(
+                "CREATE TABLE executions ("
+                "operation_id TEXT PRIMARY KEY, grant_digest TEXT NOT NULL, "
+                "grant_id TEXT NOT NULL, lease_id TEXT NOT NULL, "
+                "subject_id TEXT NOT NULL, tool_name TEXT NOT NULL, "
+                "schema_hash TEXT NOT NULL, context_digest TEXT NOT NULL, "
+                "request_digest TEXT NOT NULL, status TEXT NOT NULL, "
+                "budget_counter_value INTEGER, receipt_json TEXT, "
+                "parent_authorization_digest TEXT NOT NULL DEFAULT '', "
+                "parent_authorization_nonce TEXT NOT NULL DEFAULT '', "
+                "updated_utc TEXT NOT NULL DEFAULT "
+                "(strftime('%Y-%m-%dT%H:%M:%fZ','now')))"
+            )
+            con.execute(
+                "INSERT INTO executions("
+                "operation_id,grant_digest,grant_id,lease_id,subject_id,"
+                "tool_name,schema_hash,context_digest,request_digest,status,"
+                "budget_counter_value"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    "legacy-op", "gd", "gid", "lid", "sid",
+                    "tool", "sh", "cd", "rd", "DISPATCHING", 1,
+                ),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+        journal = ExecutionJournal(db)
+        row = journal.get("legacy-op")
+        self.assertIsNotNone(row)
+        self.assertEqual(row["status"], "DISPATCHING")
+        self.assertEqual(row["budget_counter_value"], 1)
+        self.assertIsNone(row["dispatch_started_at"])
 
 
 if __name__ == "__main__":
