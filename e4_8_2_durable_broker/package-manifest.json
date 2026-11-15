@@ -1,0 +1,47 @@
+{
+  "package": "E4.8.2 Durable Single-Writer Broker Model",
+  "scope": "software-only; no TPM/TBS access",
+  "local_validation": "13/13 tests passed in authoring environment after explicit SQLite connection closure; Windows host validation pending",
+  "files": [
+    {
+      "path": ".gitignore",
+      "bytes": 81,
+      "sha256": "af78dba0ddbf99cbdd81816f040380a1688aa7681fee1b6a89278be0df695126"
+    },
+    {
+      "path": "README.md",
+      "bytes": 1151,
+      "sha256": "61ab4d595f00174b5f4f494edd48d54cbe00d9c1a7dc2f33e2698c8b10c7bfcf"
+    },
+    {
+      "path": "docs/e4-8-2-protocol-and-test-plan.md",
+      "bytes": 4638,
+      "sha256": "95513481448ac66593afbe1c438d4536b6b30c2cd2917fea5e35f2e9454a5f23"
+    },
+    {
+      "path": "run-tests.ps1",
+      "bytes": 207,
+      "sha256": "950e6c5131eddb0cf7e70328ecfaa8ad92c6bc1a56f587a90dff23f2c66462ac"
+    },
+    {
+      "path": "src/__init__.py",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "src/durable_broker.py",
+      "bytes": 21789,
+      "sha256": "0c00156a177dbfd9bb9e955e06edb87e6917b218dba933fe1e8276f932a40d8b"
+    },
+    {
+      "path": "tests/__init__.py",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "tests/test_durable_broker.py",
+      "bytes": 9804,
+      "sha256": "4c395f3576e876815d253d45199180dd31f579e81179f9c9156d9928fa9297ff"
+    }
+  ]
+}

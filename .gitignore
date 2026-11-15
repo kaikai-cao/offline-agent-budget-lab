@@ -1,0 +1,22 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Temporary files and backups
+*.bak
+*.bak.*
+*.before-*
+*~
+
+# Generated archives
+*.zip
+
+# Editor and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

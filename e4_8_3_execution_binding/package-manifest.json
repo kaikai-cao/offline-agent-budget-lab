@@ -1,0 +1,68 @@
+{
+  "package": "E4.8.3 Lease Grant and Agent Tool Execution Binding Model",
+  "scope": "software-only; no TPM/TBS access; isolated from E4.7.3 and IEE",
+  "local_validation": {
+    "result": "20/20 unit tests passed",
+    "python": "3.13.5",
+    "platform": "Linux-6.18.57-x86_64-with-glibc2.41",
+    "cryptography": "46.0.4",
+    "windows_validation": "pending user-side execution"
+  },
+  "counter_broker_dependency": {
+    "source": "E4.8.2 src/durable_broker.py copied unchanged",
+    "sha256": "0c00156a177dbfd9bb9e955e06edb87e6917b218dba933fe1e8276f932a40d8b"
+  },
+  "files": [
+    {
+      "path": ".gitignore",
+      "bytes": 86,
+      "sha256": "cdfded7326f838d5b69311b6e3c3ff8e769204688f714f646ec250abf415d9ca"
+    },
+    {
+      "path": "README.md",
+      "bytes": 4798,
+      "sha256": "e010a070a11d5ded420601b023a4d3d3da51e59e174ff409f17e9cc0fa3a29d8"
+    },
+    {
+      "path": "docs/e4-8-3-design-and-test-plan.md",
+      "bytes": 9135,
+      "sha256": "958ef7724163a211104f45df1a9a134ffb7348015e92f2bc8f1c0dc789732edf"
+    },
+    {
+      "path": "requirements.txt",
+      "bytes": 21,
+      "sha256": "d8504d4079a4f75309950ce78f24514bc60ca51b5dba3cc704c09c566f2e68c2"
+    },
+    {
+      "path": "run-tests.ps1",
+      "bytes": 465,
+      "sha256": "5e2466682ff9e979c13cf23baeaacd765f81895b992d279eb33b3d91dc355841"
+    },
+    {
+      "path": "src/__init__.py",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "src/durable_broker.py",
+      "bytes": 21789,
+      "sha256": "0c00156a177dbfd9bb9e955e06edb87e6917b218dba933fe1e8276f932a40d8b"
+    },
+    {
+      "path": "src/execution_binding.py",
+      "bytes": 30653,
+      "sha256": "10005bc101c9a15d6efe159df951e8ba0b2f131690b19fbecce9c9b27744ba49"
+    },
+    {
+      "path": "tests/__init__.py",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "tests/test_execution_binding.py",
+      "bytes": 20217,
+      "sha256": "2a708a1a271a778c2b4fac151afa01145c5daa1b5ec3b5d911a05181e6b67758"
+    }
+  ],
+  "claims_boundary": "Model validation only; no hardware security or exactly-once external-effect proof."
+}

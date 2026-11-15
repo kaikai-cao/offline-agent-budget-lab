@@ -1,0 +1,39 @@
+========== E4 READ-ONLY PLATFORM PROBE ==========
+No TPM NV write command or configuration change is performed.
+
+
+CpuName           : Intel(R) Core(TM) i7-14700
+SystemMaker       : Dell Inc.
+SystemModel       : Dell Pro Tower QCT1250
+BaseboardMaker    : Dell Inc.
+BaseboardModel    : 0J93GF
+BaseboardVer      : A03
+BiosMaker         : Dell Inc.
+BiosVersion       : 1.20.0
+BiosDate          : 2026/10/13 8:00:00
+WindowsCaption    : Microsoft Windows 11 家庭版 Insider Preview 中文版
+WindowsVersion    : 10.0.26320
+WindowsBuild      : 26320
+HypervisorPresent : True
+
+========== TPM STATUS (Get-Tpm) ==========
+
+TpmPresent                : 
+TpmReady                  : 
+TpmEnabled                : 
+TpmActivated              : 
+TpmOwned                  : 
+ManufacturerIdTxt         : 
+ManufacturerVersion       : 
+ManufacturerVersionFull20 : 
+ManagedAuthLevel          : 
+AutoProvisioning          : 
+LockedOut                 : 
+
+========== WIN32 TPM METADATA ==========
+Win32_Tpm query unavailable: 无法从客户端中访问 CIM 资源。
+========== SECURE BOOT STATUS ==========
+Secure Boot state unavailable: 无法设置正确的权限。访问被拒绝。
+
+========== END OF READ-ONLY PROBE ==========
+This probe does not test TPM2_NV_Increment permission or NV counter availability.

@@ -1,0 +1,61 @@
+{
+  "Experiment": "E4.7.3 Real TPM NV Counter Persistence",
+  "ArchiveGeneratedAtLocal": "2026-11-13T17:18:05.0211796+08:00",
+  "RepositoryRoot": "D:\\Research\\offline-agent-budget-lab",
+  "CleanupReportSource": "C:\\Users\\dell\\AppData\\Local\\OfflineAgentBudgetLab\\E4.7.3\\cleanup-report.json",
+  "CleanupReportSHA256": "18d1e212f235867cdf6e02327667df15ea38838aad60e192e83890b17708119c",
+  "FinalLogSHA256": "07d1246d62a8c112c70826b6c19510e53fe12581c6c9427e10b2d8266ad4fda5",
+  "SourceFiles": [
+    {
+      "RelativePath": "e4_7_3_counter_test\\src\\E47TpmNative.cs",
+      "SHA256": "f1c657e7e8279eda9b30ec78ff084da277928e1868cbface25ebfa433680bb08",
+      "Present": true
+    },
+    {
+      "RelativePath": "e4_7_3_counter_test\\scripts\\00-offline-marshalling-self-test.ps1",
+      "SHA256": "fd87182bc518a32e5fa9d55295fe23941ff3efc21edd83da48f9071f4f2c9ec5",
+      "Present": true
+    },
+    {
+      "RelativePath": "e4_7_3_counter_test\\scripts\\01-create-and-increment.ps1",
+      "SHA256": "f406cf502af63158e38cde4aca847d841e8a9fc761c295ce1bbc18d9b38a60b2",
+      "Present": true
+    },
+    {
+      "RelativePath": "e4_7_3_counter_test\\scripts\\01a-resume-after-define.ps1",
+      "SHA256": "bd4feff8e84dcfde27d9617cffe724c589efaa0c4da5fcf1c2df7669f8d9925d",
+      "Present": true
+    },
+    {
+      "RelativePath": "e4_7_3_counter_test\\scripts\\01b-capture-value-before-reboot.ps1",
+      "SHA256": "842f18c36ca4b2f41a815d5064f608ad3385c03420e936f1c12aca39b2965d3f",
+      "Present": true
+    },
+    {
+      "RelativePath": "e4_7_3_counter_test\\scripts\\02-verify-after-reboot.ps1",
+      "SHA256": "9690d2bfa2ee5d2ab1be656fc1974ce1b7e8bd66e6a0277954cd296a6149e08e",
+      "Present": true
+    },
+    {
+      "RelativePath": "e4_7_3_counter_test\\scripts\\03-cleanup.ps1",
+      "SHA256": "0b1f842782511965a2224c9206dc1398a235b1b9d267a454a01929a86cff78f4",
+      "Present": true
+    },
+    {
+      "RelativePath": "e4_7_3_counter_test\\scripts\\E47-Common.ps1",
+      "SHA256": "2f5d4dc65b593faa69dbbbe3b325d3ba2f382c7989f54a338750ed29adee0483",
+      "Present": true
+    }
+  ],
+  "CounterStateSummaryIncluded": false,
+  "CleanupChecks": {
+    "Result": true,
+    "Handle": true,
+    "DeletedNvName": true,
+    "Original16NvNamesUnchanged": true,
+    "CandidateAbsent": true,
+    "HrNvIndexAfterCleanup": true,
+    "NvCountersAfterCleanup": true
+  },
+  "ArchiveScriptSentTpmCommands": false
+}

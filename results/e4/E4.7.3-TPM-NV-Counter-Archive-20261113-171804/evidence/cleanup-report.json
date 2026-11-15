@@ -1,0 +1,11 @@
+{
+  "Result": "CLEANUP_VERIFIED",
+  "Handle": "0x01BFFFFE",
+  "DeletedNvName": "000b667669216ae5f67a6da327553d35f90fbb553944969f5f28921a71532b37b201",
+  "Original16NvNamesUnchanged": true,
+  "CandidateAbsent": true,
+  "HrNvIndexAfterCleanup": 16,
+  "NvCountersAfterCleanup": 4,
+  "CompletedAtUtc": "2026-11-13T09:08:46.9266515Z",
+  "Note": "Deleting an NV Counter index does not reset the TPM-wide counter high-water history."
+}
