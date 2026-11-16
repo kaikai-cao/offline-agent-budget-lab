@@ -396,7 +396,11 @@ def coerce_tool_lookup_result(
 
 
 class ToolAdapter:
-    """Adapter contract; concrete tools must expose trusted schema and idempotency.
+    """Adapter contract for trusted schema, provider identity and recovery.
+
+    `recovery_identity` must stably identify the provider/backend and account
+    scope used by both lookup and execute. It is a non-secret adapter
+    declaration, not remote attestation.
 
     `idempotent_by_operation_id=True` is a strong adapter promise: repeated
     execute calls with the same operation_id and request_digest cause at most
@@ -407,6 +411,8 @@ class ToolAdapter:
     tool_name: str
     schema_hash: str
     idempotent_by_operation_id: bool
+    # Stable, non-secret identity of the provider/backend and account scope.
+    recovery_identity: str
 
     @property
     def capabilities(self) -> ToolCapabilities:
@@ -472,10 +478,24 @@ def _tool_recovery_contract(
         getattr(tool, "idempotent_by_operation_id", False)
     )
 
+    try:
+        recovery_identity = tool.recovery_identity
+    except AttributeError as exc:
+        raise ExecutionIndeterminate(
+            "tool recovery identity is missing"
+        ) from exc
+    if not isinstance(recovery_identity, str) or not recovery_identity.strip():
+        raise ExecutionIndeterminate(
+            "tool recovery identity must be a non-empty string"
+        )
+    recovery_identity = recovery_identity.strip()
+
     payload = {
-        "version": 1,
+        # Version 2 adds the adapter-declared provider/backend identity.
+        "version": 2,
         "tool_name": tool.tool_name,
         "schema_hash": tool.schema_hash,
+        "recovery_identity": recovery_identity,
         "naturally_idempotent": capabilities.naturally_idempotent,
         "supports_idempotency_key": capabilities.supports_idempotency_key,
         "supports_authoritative_lookup": capabilities.supports_authoritative_lookup,
@@ -495,6 +515,17 @@ class SQLiteIdempotentTool(ToolAdapter):
     """
 
     idempotent_by_operation_id = True
+
+    @property
+    def recovery_identity(self) -> str:
+        """Identify this test adapter by its configured SQLite backend path.
+
+        This is a configuration label, not database-content attestation.
+        """
+        canonical_path = os.path.normcase(
+            str(self.path.expanduser().resolve(strict=False))
+        )
+        return "sqlite-tool-db:" + canonical_path
 
     @property
     def capabilities(self) -> ToolCapabilities:

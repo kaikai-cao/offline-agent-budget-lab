@@ -43,6 +43,7 @@ class NonIdempotentTool(ToolAdapter):
     def __init__(self) -> None:
         self.tool_name = "send_message"
         self.schema_hash = schema_hash({"type": "object", "required": ["recipient", "body"]})
+        self.recovery_identity = "mock://messaging/tenant-A"
         self.idempotent_by_operation_id = False
         self.effects = 0
 
@@ -1698,6 +1699,120 @@ print(json.dumps(outcome.receipt, sort_keys=True))
             gateway.journal.get(request.operation_id)["status"],
             "INDETERMINATE",
         )
+
+
+    def test_d76_same_recovery_identity_allows_reconstructed_adapter(self):
+        from src.execution_binding import ToolLookupStatus
+
+        root, original, request, grant, gateway, now = self._d71_case(
+            retention_seconds=10
+        )
+        replacement = D63ScriptedLookupTool(
+            status=ToolLookupStatus.UNKNOWN,
+            supports_idempotency_key=True,
+            retention_seconds=10,
+            idempotency_scope="mock-send-message-tenant-A",
+        )
+        replacement.recovery_identity = original.recovery_identity
+        restarted = self._d71_gateway_at(root, replacement, lambda: now[0])
+
+        restarted.execute(grant, request)
+
+        self.assertEqual(replacement.lookup_calls, 1)
+        self.assertEqual(replacement.effects, 1)
+        self.assertEqual(restarted.broker.counter.read(), 1)
+
+    def test_d76_different_provider_identity_fails_before_tool_lookup(self):
+        from src.execution_binding import ToolLookupStatus
+
+        root, original, request, grant, gateway, now = self._d71_case(
+            retention_seconds=10
+        )
+        replacement = D63ScriptedLookupTool(
+            status=ToolLookupStatus.UNKNOWN,
+            supports_idempotency_key=True,
+            retention_seconds=10,
+            idempotency_scope="mock-send-message-tenant-A",
+        )
+        # Same tool name, schema and declared recovery capabilities, but another
+        # provider/account target.
+        replacement.recovery_identity = "mock://messaging/tenant-B"
+        restarted = self._d71_gateway_at(root, replacement, lambda: now[0])
+
+        with self.assertRaises(ExecutionIndeterminate):
+            restarted.execute(grant, request)
+
+        self.assertEqual(replacement.lookup_calls, 0)
+        self.assertEqual(replacement.effects, 0)
+        self.assertEqual(restarted.broker.counter.read(), 1)
+        self.assertEqual(
+            restarted.journal.get(request.operation_id)["status"],
+            "INDETERMINATE",
+        )
+
+    def test_d76_runtime_recovery_identity_change_fails_before_lookup(self):
+        root, tool, request, grant, gateway, now = self._d71_case(
+            retention_seconds=10
+        )
+        original_identity = tool.recovery_identity
+        tool.recovery_identity = "mock://messaging/tenant-C"
+        restarted = self._d71_gateway_at(root, tool, lambda: now[0])
+
+        with self.assertRaises(ExecutionIndeterminate):
+            restarted.execute(grant, request)
+
+        self.assertNotEqual(tool.recovery_identity, original_identity)
+        self.assertEqual(tool.lookup_calls, 0)
+        self.assertEqual(tool.effects, 0)
+        self.assertEqual(restarted.broker.counter.read(), 1)
+        self.assertEqual(
+            restarted.journal.get(request.operation_id)["status"],
+            "INDETERMINATE",
+        )
+
+    def test_d76_missing_recovery_identity_fails_before_budget_allocation(self):
+        tmp = tempfile.TemporaryDirectory(prefix="d76-missing-identity-")
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        tool = NonIdempotentTool()
+        del tool.recovery_identity
+        request = ToolRequest(
+            operation_id="op-d76-missing-identity",
+            subject_id="agent-17",
+            tool_name=tool.tool_name,
+            arguments={"recipient": "user-1", "body": "hello"},
+            context=dict(self.CONTEXT),
+        )
+        grant = self.make_grant(
+            quota=5,
+            allowed_tool_name=tool.tool_name,
+            allowed_schema_hash=tool.schema_hash,
+        )
+        gateway = self._d71_gateway_at(root, tool, lambda: self.NOW)
+
+        with self.assertRaises(ExecutionIndeterminate):
+            gateway.execute(grant, request)
+
+        self.assertEqual(gateway.broker.counter.read(), 0)
+        self.assertIsNone(gateway.journal.get(request.operation_id))
+
+    def test_d76_sqlite_adapter_identity_tracks_database_path(self):
+        tmp = tempfile.TemporaryDirectory(prefix="d76-sqlite-identity-")
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        schema = {"type": "object", "required": ["value"]}
+        first = SQLiteIdempotentTool(
+            tool_name="store_value", schema=schema, database_path=root / "first.sqlite3"
+        )
+        same_target = SQLiteIdempotentTool(
+            tool_name="store_value", schema=schema, database_path=root / "first.sqlite3"
+        )
+        other_target = SQLiteIdempotentTool(
+            tool_name="store_value", schema=schema, database_path=root / "second.sqlite3"
+        )
+
+        self.assertEqual(first.recovery_identity, same_target.recovery_identity)
+        self.assertNotEqual(first.recovery_identity, other_target.recovery_identity)
 
 
 if __name__ == "__main__":
