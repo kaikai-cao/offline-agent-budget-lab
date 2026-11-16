@@ -446,6 +446,7 @@ def _broker_identity_digest(broker: DurableCounterBroker) -> str:
         journal_path = broker.journal.path
         counter_path = broker.counter.path
         lock_path = broker.lock_path
+        counter_lock_path = broker.counter.lock_path
         lease_id = broker.lease_id
         quota_limit = broker.quota_limit
     except AttributeError as exc:
@@ -463,6 +464,17 @@ def _broker_identity_digest(broker: DurableCounterBroker) -> str:
         "counter_state_path": canonical_path(counter_path),
         "broker_lock_path": canonical_path(lock_path),
     }
+
+    # FileBackedCounter derives its lock path from the counter-state path.
+    # Keep the existing D7.5 digest unchanged for that canonical configuration,
+    # but bind any runtime override so it cannot silently split the lock domain.
+    counter_path_obj = Path(counter_path)
+    expected_counter_lock_path = counter_path_obj.with_suffix(
+        counter_path_obj.suffix + ".lock"
+    )
+    if canonical_path(counter_lock_path) != canonical_path(expected_counter_lock_path):
+        material["counter_lock_path_override"] = canonical_path(counter_lock_path)
+
     return "sha256:" + sha256_hex(material)
 
 

@@ -949,7 +949,8 @@ print(json.dumps(outcome.receipt, sort_keys=True))
     def _d71_gateway_at(
         self, root, tool, clock, *, gateway_private_key=None,
         gateway_id="gateway-lab-1", lock_name="gateway.lock",
-        broker_root=None, broker_lock_name="broker.lock"
+        broker_root=None, broker_lock_name="broker.lock",
+        broker_counter_lock_name=None
     ):
         broker_root = root if broker_root is None else Path(broker_root)
         broker_root.mkdir(parents=True, exist_ok=True)
@@ -960,6 +961,8 @@ print(json.dumps(outcome.receipt, sort_keys=True))
             lease_id="lease-offline-17",
             quota_limit=5,
         )
+        if broker_counter_lock_name is not None:
+            broker.counter.lock_path = broker_root / broker_counter_lock_name
         return ExecutionBindingGateway(
             issuer_public_key=self.issuer_private.public_key(),
             gateway_private_key=(
@@ -1813,6 +1816,50 @@ print(json.dumps(outcome.receipt, sort_keys=True))
 
         self.assertEqual(first.recovery_identity, same_target.recovery_identity)
         self.assertNotEqual(first.recovery_identity, other_target.recovery_identity)
+
+
+    def test_d77_reconstructed_counter_lock_path_change_fails_closed(self):
+        root, tool, request, grant, gateway, now = self._d71_case(
+            retention_seconds=10
+        )
+        other = self._d71_gateway_at(
+            root, tool, lambda: now[0],
+            lock_name="alternate-gateway.lock",
+            broker_counter_lock_name="alternate-counter.lock",
+        )
+
+        self.assertNotEqual(
+            other.broker_identity_digest, gateway.broker_identity_digest
+        )
+        with self.assertRaises(ExecutionIndeterminate):
+            other.execute(grant, request)
+
+        self.assertEqual(tool.lookup_calls, 0)
+        self.assertEqual(tool.effects, 0)
+        self.assertEqual(other.broker.counter.read(), 1)
+        self.assertEqual(
+            other.journal.get(request.operation_id)["status"],
+            "INDETERMINATE",
+        )
+
+    def test_d77_runtime_counter_lock_path_change_fails_closed(self):
+        root, tool, request, grant, gateway, now = self._d71_case(
+            retention_seconds=10
+        )
+        original_digest = gateway.broker_identity_digest
+        gateway.broker.counter.lock_path = root / "replacement-counter.lock"
+
+        with self.assertRaises(ExecutionIndeterminate):
+            gateway.execute(grant, request)
+
+        self.assertNotEqual(gateway.broker_identity_digest, original_digest)
+        self.assertEqual(tool.lookup_calls, 0)
+        self.assertEqual(tool.effects, 0)
+        self.assertEqual(gateway.broker.counter.read(), 1)
+        self.assertEqual(
+            gateway.journal.get(request.operation_id)["status"],
+            "INDETERMINATE",
+        )
 
 
 if __name__ == "__main__":
