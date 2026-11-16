@@ -437,24 +437,43 @@ class ToolAdapter:
 
 
 def _broker_identity_digest(broker: DurableCounterBroker) -> str:
-    """Hash the configured Broker lease, quota and durable storage locations.
+    """Hash either the legacy single-Lease Broker or shared global Broker.
 
-    This detects accidental or unauthorized reconfiguration within the
-    software model. It does not attest file contents or resist a local admin.
+    The global adapter identity is stable across Lease bindings: the shared
+    global budget epoch, issuer key, Broker configuration and storage domain
+    are pinned, while per-Lease grant identity is bound into each request.
     """
-    try:
-        journal_path = broker.journal.path
-        counter_path = broker.counter.path
-        lock_path = broker.lock_path
-        counter_lock_path = broker.counter.lock_path
-        lease_id = broker.lease_id
-        quota_limit = broker.quota_limit
-    except AttributeError as exc:
-        raise ValueError("Broker does not expose the expected durable storage configuration") from exc
-
     def canonical_path(value: str | Path) -> str:
         resolved = Path(value).expanduser().resolve(strict=False)
         return os.path.normcase(str(resolved))
+
+    try:
+        journal_path = broker.journal.path
+        counter_path = broker.counter.path
+        counter_lock_path = broker.counter.lock_path
+        lock_path = broker.lock_path
+    except AttributeError as exc:
+        raise ValueError("Broker does not expose the expected durable storage configuration") from exc
+
+    if getattr(broker, "is_global_budget_adapter", False):
+        material = {
+            "version": 2,
+            "global_budget_id": broker.global_budget_id,
+            "global_quota_limit": broker.global_quota_limit,
+            "issuer_public_key_digest": broker.issuer_public_key_digest,
+            "config_digest": broker.config_digest,
+            "broker_journal_path": canonical_path(journal_path),
+            "counter_state_path": canonical_path(counter_path),
+            "counter_lock_path": canonical_path(counter_lock_path),
+            "broker_lock_path": canonical_path(lock_path),
+        }
+        return "sha256:" + sha256_hex(material)
+
+    try:
+        lease_id = broker.lease_id
+        quota_limit = broker.quota_limit
+    except AttributeError as exc:
+        raise ValueError("Broker does not expose the expected Lease configuration") from exc
 
     material = {
         "version": 1,
@@ -465,12 +484,9 @@ def _broker_identity_digest(broker: DurableCounterBroker) -> str:
         "broker_lock_path": canonical_path(lock_path),
     }
 
-    # FileBackedCounter derives its lock path from the counter-state path.
-    # Keep the existing D7.5 digest unchanged for that canonical configuration,
-    # but bind any runtime override so it cannot silently split the lock domain.
-    counter_path_obj = Path(counter_path)
-    expected_counter_lock_path = counter_path_obj.with_suffix(
-        counter_path_obj.suffix + ".lock"
+    # Preserve D7.5's digest for the canonical FileBackedCounter lock path.
+    expected_counter_lock_path = Path(counter_path).with_suffix(
+        Path(counter_path).suffix + ".lock"
     )
     if canonical_path(counter_lock_path) != canonical_path(expected_counter_lock_path):
         material["counter_lock_path_override"] = canonical_path(counter_lock_path)
@@ -664,6 +680,10 @@ class ExecutionJournal:
                 "tool_capabilities_digest TEXT, "
                 "gateway_id TEXT, "
                 "gateway_public_key_digest TEXT, "
+                "global_budget_id TEXT, "
+                "global_lease_grant_digest TEXT, "
+                "global_sequence INTEGER, "
+                "lease_used_count INTEGER, "
                 "updated_utc TEXT NOT NULL DEFAULT "
                 "(strftime('%Y-%m-%dT%H:%M:%fZ','now')))"
             )
@@ -697,6 +717,14 @@ class ExecutionJournal:
                 con.execute(
                     "ALTER TABLE executions ADD COLUMN gateway_public_key_digest TEXT"
                 )
+            for column, sql_type in (
+                ("global_budget_id", "TEXT"),
+                ("global_lease_grant_digest", "TEXT"),
+                ("global_sequence", "INTEGER"),
+                ("lease_used_count", "INTEGER"),
+            ):
+                if column not in columns:
+                    con.execute(f"ALTER TABLE executions ADD COLUMN {column} {sql_type}")
             con.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS ux_executions_parent_nonce "
                 "ON executions(parent_authorization_nonce) "
@@ -815,7 +843,8 @@ class ExecutionJournal:
                 "SELECT operation_id,grant_digest,grant_id,lease_id,subject_id,tool_name,"
                 "schema_hash,context_digest,request_digest,status,budget_counter_value,receipt_json,"
                 "parent_authorization_digest,parent_authorization_nonce,dispatch_started_at,"
-                "tool_capabilities_digest,gateway_id,gateway_public_key_digest "
+                "tool_capabilities_digest,gateway_id,gateway_public_key_digest,"
+                "global_budget_id,global_lease_grant_digest,global_sequence,lease_used_count "
                 "FROM executions WHERE operation_id=?", (operation_id,)
             ).fetchone()
         if row is None:
@@ -824,7 +853,8 @@ class ExecutionJournal:
                 "tool_name", "schema_hash", "context_digest", "request_digest", "status",
                 "budget_counter_value", "receipt_json", "parent_authorization_digest",
                 "parent_authorization_nonce", "dispatch_started_at", "tool_capabilities_digest",
-                "gateway_id", "gateway_public_key_digest")
+                "gateway_id", "gateway_public_key_digest", "global_budget_id",
+                "global_lease_grant_digest", "global_sequence", "lease_used_count")
         return dict(zip(keys, row))
 
     def unresolved_other_than(self, operation_id: str) -> list[str]:
@@ -844,15 +874,17 @@ class ExecutionJournal:
                     "INSERT INTO executions(operation_id,grant_digest,grant_id,lease_id,subject_id,"
                     "tool_name,schema_hash,context_digest,request_digest,status,"
                     "parent_authorization_digest,parent_authorization_nonce,gateway_id,"
-                    "gateway_public_key_digest) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,'ALLOCATING',?,?,?,?)",
+                    "gateway_public_key_digest,global_budget_id,global_lease_grant_digest) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,'ALLOCATING',?,?,?,?,?,?)",
                     (record["operation_id"], record["grant_digest"], record["grant_id"],
                      record["lease_id"], record["subject_id"], record["tool_name"],
                      record["schema_hash"], record["context_digest"], record["request_digest"],
                      record.get("parent_authorization_digest", ""),
                      record.get("parent_authorization_nonce", ""),
                      record.get("gateway_id"),
-                     record.get("gateway_public_key_digest")),
+                     record.get("gateway_public_key_digest"),
+                     record.get("global_budget_id"),
+                     record.get("global_lease_grant_digest")),
                 )
             except sqlite3.IntegrityError as exc:
                 parent_nonce = record.get("parent_authorization_nonce", "")
@@ -875,13 +907,45 @@ class ExecutionJournal:
                 raise
             con.commit()
 
-    def set_budget_consumed(self, operation_id: str, counter_value: int) -> None:
+    def set_budget_consumed(
+        self,
+        operation_id: str,
+        counter_value: int,
+        *,
+        global_budget_id: str | None = None,
+        global_lease_grant_digest: str | None = None,
+        global_sequence: int | None = None,
+        lease_used_count: int | None = None,
+    ) -> None:
+        global_values = (
+            global_budget_id, global_lease_grant_digest,
+            global_sequence, lease_used_count,
+        )
+        if all(value is None for value in global_values):
+            pass
+        elif (
+            not isinstance(global_budget_id, str) or not global_budget_id.strip()
+            or not isinstance(global_lease_grant_digest, str)
+            or len(global_lease_grant_digest) != 71
+            or not global_lease_grant_digest.startswith("sha256:")
+            or any(ch not in "0123456789abcdef" for ch in global_lease_grant_digest[7:])
+            or not isinstance(global_sequence, int) or isinstance(global_sequence, bool)
+            or global_sequence != counter_value
+            or not isinstance(lease_used_count, int) or isinstance(lease_used_count, bool)
+            or lease_used_count < 1
+        ):
+            raise ValueError("global budget receipt metadata is invalid")
+
         with _ClosingConnection(self.path) as con:
             con.execute("BEGIN IMMEDIATE")
             con.execute(
                 "UPDATE executions SET status='BUDGET_CONSUMED',budget_counter_value=?, "
+                "global_budget_id=?,global_lease_grant_digest=?,global_sequence=?,lease_used_count=?, "
                 "updated_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE operation_id=?",
-                (counter_value, operation_id),
+                (
+                    counter_value, global_budget_id, global_lease_grant_digest,
+                    global_sequence, lease_used_count, operation_id,
+                ),
             )
             con.commit()
 
@@ -983,7 +1047,7 @@ class ExecutionBindingGateway:
         self.tools = dict(tools)
         self.clock = clock or (lambda: int(time.time()))
 
-    def _validate(self, grant: LeaseGrant, request: ToolRequest) -> tuple[ToolAdapter, str, str]:
+    def _validate(self, grant: LeaseGrant, request: ToolRequest) -> tuple[ToolAdapter, str, str, Mapping[str, str] | None]:
         verify_lease_grant(grant, self.issuer_public_key)
         now = int(self.clock())
         if now < grant.issued_at:
@@ -998,10 +1062,41 @@ class ExecutionBindingGateway:
             raise GrantRejected("request operation_id differs from signed lease grant")
         if context_hash(request.context) != grant.context_digest:
             raise GrantRejected("request context differs from grant context digest")
-        if self.broker.lease_id != grant.lease_id:
-            raise GrantRejected("grant lease_id differs from configured counter broker")
-        if self.broker.quota_limit != grant.quota_limit:
-            raise GrantRejected("grant quota_limit differs from configured counter broker")
+        budget_binding: Mapping[str, str] | None = None
+        binding_resolver = getattr(self.broker, "binding_for_execution_grant", None)
+        if callable(binding_resolver):
+            adapter_issuer_digest = getattr(self.broker, "issuer_public_key_digest", None)
+            if adapter_issuer_digest is not None:
+                gateway_issuer_digest = "sha256:" + hashlib.sha256(
+                    self.issuer_public_key.public_bytes(Encoding.Raw, PublicFormat.Raw)
+                ).hexdigest()
+                if gateway_issuer_digest != adapter_issuer_digest:
+                    raise GrantRejected(
+                        "Execution Gateway and Global Budget Broker trust different Issuer keys"
+                    )
+            budget_binding = binding_resolver(grant)
+            if not isinstance(budget_binding, Mapping):
+                raise GrantRejected("global budget adapter returned an invalid Lease binding")
+            global_budget_id = budget_binding.get("global_budget_id")
+            global_lease_grant_digest = budget_binding.get("global_lease_grant_digest")
+            if not isinstance(global_budget_id, str) or not global_budget_id.strip():
+                raise GrantRejected("global budget binding omitted global_budget_id")
+            if (
+                not isinstance(global_lease_grant_digest, str)
+                or len(global_lease_grant_digest) != 71
+                or not global_lease_grant_digest.startswith("sha256:")
+                or any(ch not in "0123456789abcdef" for ch in global_lease_grant_digest[7:])
+            ):
+                raise GrantRejected("global budget binding omitted a valid Lease Grant digest")
+            budget_binding = {
+                "global_budget_id": global_budget_id,
+                "global_lease_grant_digest": global_lease_grant_digest,
+            }
+        else:
+            if self.broker.lease_id != grant.lease_id:
+                raise GrantRejected("grant lease_id differs from configured counter broker")
+            if self.broker.quota_limit != grant.quota_limit:
+                raise GrantRejected("grant quota_limit differs from configured counter broker")
         tool = self.tools.get(request.tool_name)
         if tool is None:
             raise GrantRejected("tool is not registered in the trusted gateway")
@@ -1032,8 +1127,10 @@ class ExecutionBindingGateway:
             "schema_hash": tool.schema_hash,
             "arguments": dict(request.arguments),
         }
+        if budget_binding is not None:
+            digest_material["global_budget_binding"] = dict(budget_binding)
         request_digest = "sha256:" + sha256_hex(digest_material)
-        return tool, context_digest, request_digest
+        return tool, context_digest, request_digest, budget_binding
 
     def execute(
         self,
@@ -1044,7 +1141,7 @@ class ExecutionBindingGateway:
     ) -> ExecutionOutcome:
         if crash_at not in self.VALID_CRASH_POINTS:
             raise ValueError(f"unsupported crash point: {crash_at}")
-        tool, context_digest_value, request_digest = self._validate(grant, request)
+        tool, context_digest_value, request_digest, budget_binding = self._validate(grant, request)
         record = {
             "operation_id": request.operation_id,
             "grant_digest": grant.grant_digest,
@@ -1059,6 +1156,12 @@ class ExecutionBindingGateway:
             "parent_authorization_nonce": grant.parent_authorization_nonce,
             "gateway_id": self.gateway_id,
             "gateway_public_key_digest": self.gateway_public_key_digest,
+            "global_budget_id": (
+                budget_binding["global_budget_id"] if budget_binding is not None else None
+            ),
+            "global_lease_grant_digest": (
+                budget_binding["global_lease_grant_digest"] if budget_binding is not None else None
+            ),
         }
 
         with CrossProcessFileLock(self.lock_path):
@@ -1140,12 +1243,29 @@ class ExecutionBindingGateway:
                 self.journal.create_allocating(record)
                 existing = self.journal.get(request.operation_id)
 
+            budget_metadata_for_receipt = {
+                "global_budget_id": existing.get("global_budget_id"),
+                "global_lease_grant_digest": existing.get("global_lease_grant_digest"),
+                "global_sequence": existing.get("global_sequence"),
+                "lease_used_count": existing.get("lease_used_count"),
+            }
             if existing["status"] == "ALLOCATING":
                 try:
-                    budget_receipt = self.broker.consume(
-                        operation_id=request.operation_id,
-                        request_digest=request_digest,
-                    )
+                    consume_for_grant = getattr(self.broker, "consume_for_grant", None)
+                    if callable(consume_for_grant):
+                        budget_receipt = consume_for_grant(
+                            grant,
+                            operation_id=request.operation_id,
+                            request_digest=request_digest,
+                        )
+                    else:
+                        budget_receipt = self.broker.consume(
+                            operation_id=request.operation_id,
+                            request_digest=request_digest,
+                        )
+                except GrantRejected:
+                    self.journal.set_status(request.operation_id, "FAILED_NO_BUDGET")
+                    raise
                 except OperationNotApplied as exc:
                     self.journal.set_status(request.operation_id, "FAILED_NO_BUDGET")
                     raise BudgetAllocationFailed(
@@ -1162,13 +1282,72 @@ class ExecutionBindingGateway:
                 except BrokerIndeterminate as exc:
                     self.journal.set_status(request.operation_id, "INDETERMINATE")
                     raise ExecutionIndeterminate(f"budget broker could not safely allocate: {exc}") from exc
-                if (budget_receipt.lease_id != grant.lease_id
-                        or budget_receipt.operation_id != request.operation_id
-                        or budget_receipt.request_digest != request_digest
-                        or not isinstance(budget_receipt.counter_value, int)
-                        or budget_receipt.counter_value < 1):
+                global_budget_id = getattr(budget_receipt, "global_budget_id", None)
+                global_sequence = getattr(budget_receipt, "global_sequence", None)
+                lease_used_count = getattr(budget_receipt, "lease_used_count", None)
+                global_lease_grant_digest = getattr(
+                    budget_receipt, "global_lease_grant_digest", None
+                )
+                counter_value = getattr(budget_receipt, "counter_value", None)
+                receipt_binding_ok = (
+                    budget_receipt.lease_id == grant.lease_id
+                    and budget_receipt.operation_id == request.operation_id
+                    and budget_receipt.request_digest == request_digest
+                    and isinstance(counter_value, int)
+                    and not isinstance(counter_value, bool)
+                    and counter_value >= 1
+                )
+                if budget_binding is not None:
+                    receipt_binding_ok = receipt_binding_ok and (
+                        global_budget_id == budget_binding["global_budget_id"]
+                        and global_sequence == counter_value
+                        and isinstance(lease_used_count, int)
+                        and not isinstance(lease_used_count, bool)
+                        and lease_used_count >= 1
+                        and global_lease_grant_digest == budget_binding["global_lease_grant_digest"]
+                    )
+                elif any(value is not None for value in (
+                    global_budget_id, global_sequence, lease_used_count,
+                    global_lease_grant_digest,
+                )):
+                    receipt_binding_ok = False
+
+                if not receipt_binding_ok:
                     self.journal.set_status(request.operation_id, "INDETERMINATE")
                     raise ExecutionIndeterminate("Broker returned a receipt with mismatched bindings")
+                self.journal.set_budget_consumed(
+                    request.operation_id,
+                    counter_value,
+                    global_budget_id=global_budget_id,
+                    global_lease_grant_digest=global_lease_grant_digest,
+                    global_sequence=global_sequence,
+                    lease_used_count=lease_used_count,
+                )
+                existing = self.journal.get(request.operation_id)
+                if budget_binding is not None:
+                    expected_global_metadata = (
+                        budget_binding["global_budget_id"],
+                        budget_binding["global_lease_grant_digest"],
+                        global_sequence,
+                        lease_used_count,
+                    )
+                    persisted_global_metadata = (
+                        existing.get("global_budget_id"),
+                        existing.get("global_lease_grant_digest"),
+                        existing.get("global_sequence"),
+                        existing.get("lease_used_count"),
+                    )
+                    if persisted_global_metadata != expected_global_metadata:
+                        self.journal.set_status(request.operation_id, "INDETERMINATE")
+                        raise ExecutionIndeterminate(
+                            "persisted global budget receipt metadata differs from the validated Broker receipt"
+                        )
+                    budget_metadata_for_receipt = {
+                        "global_budget_id": global_budget_id,
+                        "global_lease_grant_digest": global_lease_grant_digest,
+                        "global_sequence": global_sequence,
+                        "lease_used_count": lease_used_count,
+                    }
                 if crash_at == "after_budget_allocation":
                     raise InjectedCrash("crash after durable broker allocation and before gateway journal update")
                 self.journal.set_budget_consumed(request.operation_id, budget_receipt.counter_value)
@@ -1292,8 +1471,11 @@ class ExecutionBindingGateway:
                 self.journal.set_status(request.operation_id, "INDETERMINATE")
                 raise ExecutionIndeterminate("unsupported tool lookup state")
 
-            receipt = self._make_receipt(grant, request, tool, context_digest_value,
-                                         request_digest, int(existing["budget_counter_value"]), result)
+            receipt = self._make_receipt(
+                grant, request, tool, context_digest_value,
+                request_digest, int(existing["budget_counter_value"]), result,
+                budget_metadata=budget_metadata_for_receipt,
+            )
             self.journal.commit_receipt(request.operation_id, receipt)
             if crash_at == "after_receipt_commit":
                 raise InjectedCrash("crash after durable execution receipt commit")
@@ -1308,6 +1490,8 @@ class ExecutionBindingGateway:
         request_digest: str,
         counter_value: int,
         result: Mapping[str, Any],
+        *,
+        budget_metadata: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         result_obj = dict(result)
         result_digest = "sha256:" + sha256_hex(result_obj)
@@ -1333,6 +1517,8 @@ class ExecutionBindingGateway:
             "result": result_obj,
             "completed_at": int(self.clock()),
         }
+        if budget_metadata and budget_metadata.get("global_budget_id") is not None:
+            payload.update(dict(budget_metadata))
         signature = self.gateway_private_key.sign(canonical_json_bytes(payload))
         return {
             "payload": payload,
@@ -1348,6 +1534,24 @@ def verify_execution_receipt(
         signature = base64.b64decode(receipt["signature_b64"], validate=True)
         if payload["result_digest"] != "sha256:" + sha256_hex(payload["result"]):
             return False
+        if "global_budget_id" in payload:
+            if not isinstance(payload.get("global_budget_id"), str) or not payload["global_budget_id"]:
+                return False
+            if payload.get("global_sequence") != payload.get("budget_counter_value"):
+                return False
+            if (
+                not isinstance(payload.get("lease_used_count"), int)
+                or isinstance(payload.get("lease_used_count"), bool)
+                or payload["lease_used_count"] < 1
+            ):
+                return False
+            digest = payload.get("global_lease_grant_digest")
+            if (
+                not isinstance(digest, str) or len(digest) != 71
+                or not digest.startswith("sha256:")
+                or any(ch not in "0123456789abcdef" for ch in digest[7:])
+            ):
+                return False
         trusted_gateway_public_key.verify(signature, canonical_json_bytes(payload))
         return True
     except (KeyError, TypeError, ValueError, InvalidSignature):
