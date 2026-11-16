@@ -947,12 +947,15 @@ print(json.dumps(outcome.receipt, sort_keys=True))
 
     def _d71_gateway_at(
         self, root, tool, clock, *, gateway_private_key=None,
-        gateway_id="gateway-lab-1", lock_name="gateway.lock"
+        gateway_id="gateway-lab-1", lock_name="gateway.lock",
+        broker_root=None, broker_lock_name="broker.lock"
     ):
+        broker_root = root if broker_root is None else Path(broker_root)
+        broker_root.mkdir(parents=True, exist_ok=True)
         broker = DurableCounterBroker(
-            journal_path=root / "budget-journal.sqlite3",
-            counter_state_path=root / "counter.json",
-            broker_lock_path=root / "broker.lock",
+            journal_path=broker_root / "budget-journal.sqlite3",
+            counter_state_path=broker_root / "counter.json",
+            broker_lock_path=broker_root / broker_lock_name,
             lease_id="lease-offline-17",
             quota_limit=5,
         )
@@ -1466,8 +1469,8 @@ print(json.dumps(outcome.receipt, sort_keys=True))
         barrier = threading.Barrier(2)
 
         identities = [
-            ("gateway-race-A", "sha256:" + "a" * 64),
-            ("gateway-race-B", "sha256:" + "b" * 64),
+            ("gateway-race-A", "sha256:" + "a" * 64, "sha256:" + "1" * 64),
+            ("gateway-race-B", "sha256:" + "b" * 64, "sha256:" + "2" * 64),
         ]
 
         def attempt(journal, identity):
@@ -1487,7 +1490,7 @@ print(json.dumps(outcome.receipt, sort_keys=True))
         self.assertEqual(sorted(result for _, result in results), ["bound", "rejected"])
         with closing(sqlite3.connect(db)) as con:
             stored = con.execute(
-                "SELECT gateway_id,gateway_public_key_digest "
+                "SELECT gateway_id,gateway_public_key_digest,broker_identity_digest "
                 "FROM gateway_identity WHERE singleton_id=1"
             ).fetchone()
         self.assertIn(tuple(stored), identities)
@@ -1496,7 +1499,9 @@ print(json.dumps(outcome.receipt, sort_keys=True))
         tmp = tempfile.TemporaryDirectory(prefix="d74-bootstrap-")
         self.addCleanup(tmp.cleanup)
         db = Path(tmp.name) / "d73-journal.sqlite3"
-        identity = ("gateway-lab-1", "sha256:" + "c" * 64)
+        identity = (
+            "gateway-lab-1", "sha256:" + "c" * 64, "sha256:" + "d" * 64
+        )
 
         con = sqlite3.connect(db)
         try:
@@ -1534,10 +1539,165 @@ print(json.dumps(outcome.receipt, sort_keys=True))
         journal.bind_gateway_identity(*identity)
         with closing(sqlite3.connect(db)) as con:
             stored = con.execute(
-                "SELECT gateway_id,gateway_public_key_digest "
+                "SELECT gateway_id,gateway_public_key_digest,broker_identity_digest "
                 "FROM gateway_identity WHERE singleton_id=1"
             ).fetchone()
         self.assertEqual(stored, identity)
+
+
+    def test_d75_broker_configuration_is_persisted_and_stable(self):
+        root, tool, request, grant, gateway, now = self._d71_case(
+            retention_seconds=10
+        )
+        with closing(sqlite3.connect(root / "execution-journal.sqlite3")) as con:
+            row = con.execute(
+                "SELECT gateway_id,gateway_public_key_digest,broker_identity_digest "
+                "FROM gateway_identity WHERE singleton_id=1"
+            ).fetchone()
+
+        self.assertEqual(
+            row,
+            (
+                gateway.gateway_id,
+                gateway.gateway_public_key_digest,
+                gateway.broker_identity_digest,
+            ),
+        )
+        self.assertRegex(row[2], r"^sha256:[0-9a-f]{64}$")
+
+        restarted = self._d71_gateway_at(root, tool, lambda: now[0])
+        self.assertEqual(
+            restarted.broker_identity_digest,
+            gateway.broker_identity_digest,
+        )
+        restarted.execute(grant, request)
+        self.assertEqual(tool.effects, 1)
+        self.assertEqual(restarted.broker.counter.read(), 1)
+
+    def test_d75_different_broker_storage_fails_closed_before_tool_lookup(self):
+        root, tool, request, grant, gateway, now = self._d71_case(
+            retention_seconds=10
+        )
+        alternate_broker_root = root / "alternate-broker"
+        other = self._d71_gateway_at(
+            root,
+            tool,
+            lambda: now[0],
+            broker_root=alternate_broker_root,
+            broker_lock_name="alternate-broker.lock",
+            lock_name="alternate-gateway.lock",
+        )
+
+        with self.assertRaises(ExecutionIndeterminate):
+            other.execute(grant, request)
+
+        self.assertEqual(tool.lookup_calls, 0)
+        self.assertEqual(tool.effects, 0)
+        self.assertEqual(gateway.broker.counter.read(), 1)
+        self.assertEqual(other.broker.counter.read(), 0)
+        self.assertEqual(
+            other.journal.get(request.operation_id)["status"],
+            "INDETERMINATE",
+        )
+
+    def test_d75_d74_registry_migration_pins_first_broker_configuration(self):
+        tmp = tempfile.TemporaryDirectory(prefix="d75-d74-migration-")
+        self.addCleanup(tmp.cleanup)
+        db = Path(tmp.name) / "execution-journal.sqlite3"
+        gateway_id = "gateway-lab-1"
+        key_digest = "sha256:" + "e" * 64
+        broker_digest = "sha256:" + "f" * 64
+        alternate_digest = "sha256:" + "1" * 64
+
+        con = sqlite3.connect(db)
+        try:
+            con.execute(
+                "CREATE TABLE gateway_identity ("
+                "singleton_id INTEGER PRIMARY KEY CHECK(singleton_id=1), "
+                "gateway_id TEXT NOT NULL, "
+                "gateway_public_key_digest TEXT NOT NULL, "
+                "created_utc TEXT NOT NULL DEFAULT "
+                "(strftime('%Y-%m-%dT%H:%M:%fZ','now')) )"
+            )
+            con.execute(
+                "INSERT INTO gateway_identity(singleton_id,gateway_id,gateway_public_key_digest) "
+                "VALUES(1,?,?)",
+                (gateway_id, key_digest),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+        journal = ExecutionJournal(db)
+        journal.bind_gateway_identity(gateway_id, key_digest, broker_digest)
+        with closing(sqlite3.connect(db)) as con:
+            stored = con.execute(
+                "SELECT gateway_id,gateway_public_key_digest,broker_identity_digest "
+                "FROM gateway_identity WHERE singleton_id=1"
+            ).fetchone()
+        self.assertEqual(stored, (gateway_id, key_digest, broker_digest))
+
+        with self.assertRaises(ExecutionIndeterminate):
+            journal.bind_gateway_identity(gateway_id, key_digest, alternate_digest)
+
+    def test_d75_competing_broker_bindings_are_serialized(self):
+        tmp = tempfile.TemporaryDirectory(prefix="d75-race-")
+        self.addCleanup(tmp.cleanup)
+        db = Path(tmp.name) / "execution-journal.sqlite3"
+        first = ExecutionJournal(db)
+        second = ExecutionJournal(db)
+        barrier = threading.Barrier(2)
+        identity = ("gateway-race", "sha256:" + "a" * 64)
+        broker_digests = ["sha256:" + "b" * 64, "sha256:" + "c" * 64]
+
+        def attempt(journal, broker_digest):
+            barrier.wait(timeout=10)
+            try:
+                journal.bind_gateway_identity(*identity, broker_digest)
+                return "bound"
+            except ExecutionIndeterminate:
+                return "rejected"
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(
+                lambda item: attempt(item[0], item[1]),
+                [(first, broker_digests[0]), (second, broker_digests[1])],
+            ))
+
+        self.assertEqual(sorted(results), ["bound", "rejected"])
+        with closing(sqlite3.connect(db)) as con:
+            stored = con.execute(
+                "SELECT gateway_id,gateway_public_key_digest,broker_identity_digest "
+                "FROM gateway_identity WHERE singleton_id=1"
+            ).fetchone()
+        self.assertIn(tuple(stored), [
+            (identity[0], identity[1], broker_digests[0]),
+            (identity[0], identity[1], broker_digests[1]),
+        ])
+
+
+    def test_d75_broker_path_change_after_gateway_construction_fails_closed(self):
+        root, tool, request, grant, gateway, now = self._d71_case(
+            retention_seconds=10
+        )
+        self.assertEqual(gateway.broker.counter.read(), 1)
+        original_digest = gateway.broker_identity_digest
+
+        # Mutate the already-constructed Broker object. A constructor-cached
+        # digest would miss this and incorrectly allow recovery to continue.
+        gateway.broker.lock_path = root / "replacement-broker.lock"
+
+        with self.assertRaises(ExecutionIndeterminate):
+            gateway.execute(grant, request)
+
+        self.assertNotEqual(gateway.broker_identity_digest, original_digest)
+        self.assertEqual(tool.lookup_calls, 0)
+        self.assertEqual(tool.effects, 0)
+        self.assertEqual(gateway.broker.counter.read(), 1)
+        self.assertEqual(
+            gateway.journal.get(request.operation_id)["status"],
+            "INDETERMINATE",
+        )
 
 
 if __name__ == "__main__":

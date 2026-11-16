@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 import base64
 import hashlib
 import json
+import os
 from pathlib import Path
 import sqlite3
 import time
@@ -429,6 +430,36 @@ class ToolAdapter:
         raise NotImplementedError
 
 
+def _broker_identity_digest(broker: DurableCounterBroker) -> str:
+    """Hash the configured Broker lease, quota and durable storage locations.
+
+    This detects accidental or unauthorized reconfiguration within the
+    software model. It does not attest file contents or resist a local admin.
+    """
+    try:
+        journal_path = broker.journal.path
+        counter_path = broker.counter.path
+        lock_path = broker.lock_path
+        lease_id = broker.lease_id
+        quota_limit = broker.quota_limit
+    except AttributeError as exc:
+        raise ValueError("Broker does not expose the expected durable storage configuration") from exc
+
+    def canonical_path(value: str | Path) -> str:
+        resolved = Path(value).expanduser().resolve(strict=False)
+        return os.path.normcase(str(resolved))
+
+    material = {
+        "version": 1,
+        "lease_id": lease_id,
+        "quota_limit": quota_limit,
+        "broker_journal_path": canonical_path(journal_path),
+        "counter_state_path": canonical_path(counter_path),
+        "broker_lock_path": canonical_path(lock_path),
+    }
+    return "sha256:" + sha256_hex(material)
+
+
 def _tool_recovery_contract(
     tool: ToolAdapter,
 ) -> tuple[ToolCapabilities, bool, str]:
@@ -638,12 +669,21 @@ class ExecutionJournal:
                 "singleton_id INTEGER PRIMARY KEY CHECK(singleton_id=1), "
                 "gateway_id TEXT NOT NULL, "
                 "gateway_public_key_digest TEXT NOT NULL, "
+                "broker_identity_digest TEXT, "
                 "created_utc TEXT NOT NULL DEFAULT "
                 "(strftime('%Y-%m-%dT%H:%M:%fZ','now')))"
             )
+            identity_columns = {
+                row[1] for row in con.execute("PRAGMA table_info(gateway_identity)").fetchall()
+            }
+            if "broker_identity_digest" not in identity_columns:
+                con.execute(
+                    "ALTER TABLE gateway_identity ADD COLUMN broker_identity_digest TEXT"
+                )
 
     def bind_gateway_identity(
-        self, gateway_id: str, gateway_public_key_digest: str
+        self, gateway_id: str, gateway_public_key_digest: str,
+        broker_identity_digest: str
     ) -> None:
         """Pin this execution journal to exactly one Gateway identity.
 
@@ -662,17 +702,41 @@ class ExecutionJournal:
         ):
             raise ValueError("gateway_public_key_digest must be a sha256 digest")
 
+        for value, name in (
+            (gateway_public_key_digest, "gateway_public_key_digest"),
+            (broker_identity_digest, "broker_identity_digest"),
+        ):
+            if (
+                not isinstance(value, str)
+                or len(value) != 71
+                or not value.startswith("sha256:")
+                or any(c not in "0123456789abcdef" for c in value[7:])
+            ):
+                raise ValueError(f"{name} must be a sha256 digest")
+
         identity = (gateway_id, gateway_public_key_digest)
         with _ClosingConnection(self.path) as con:
             con.execute("BEGIN IMMEDIATE")
             stored = con.execute(
-                "SELECT gateway_id,gateway_public_key_digest "
+                "SELECT gateway_id,gateway_public_key_digest,broker_identity_digest "
                 "FROM gateway_identity WHERE singleton_id=1"
             ).fetchone()
             if stored is not None:
-                if tuple(stored) != identity:
+                if tuple(stored[:2]) != identity:
                     raise ExecutionIndeterminate(
                         "execution journal is already bound to a different Gateway identity"
+                    )
+                stored_broker_digest = stored[2]
+                if stored_broker_digest is None:
+                    # D7.4 registry upgrade: pin the currently configured Broker once.
+                    con.execute(
+                        "UPDATE gateway_identity SET broker_identity_digest=? "
+                        "WHERE singleton_id=1 AND broker_identity_digest IS NULL",
+                        (broker_identity_digest,),
+                    )
+                elif stored_broker_digest != broker_identity_digest:
+                    raise ExecutionIndeterminate(
+                        "execution journal is already bound to a different Broker configuration"
                     )
                 con.commit()
                 return
@@ -696,9 +760,9 @@ class ExecutionJournal:
 
             con.execute(
                 "INSERT INTO gateway_identity("
-                "singleton_id,gateway_id,gateway_public_key_digest"
-                ") VALUES(1,?,?)",
-                identity,
+                "singleton_id,gateway_id,gateway_public_key_digest,broker_identity_digest"
+                ") VALUES(1,?,?,?)",
+                (gateway_id, gateway_public_key_digest, broker_identity_digest),
             )
             con.commit()
 
@@ -870,6 +934,7 @@ class ExecutionBindingGateway:
         )
         self.gateway_id = gateway_id
         self.broker = broker
+        self.broker_identity_digest = _broker_identity_digest(broker)
         self.journal = ExecutionJournal(journal_path)
         self.lock_path = Path(lock_path)
         self.tools = dict(tools)
@@ -995,9 +1060,16 @@ class ExecutionBindingGateway:
 
             # First validate the operation's own persisted identity above.
             # Then enforce the journal-wide identity before admitting new work.
-            self.journal.bind_gateway_identity(
-                self.gateway_id, self.gateway_public_key_digest
-            )
+            self.broker_identity_digest = _broker_identity_digest(self.broker)
+            try:
+                self.journal.bind_gateway_identity(
+                    self.gateway_id, self.gateway_public_key_digest,
+                    self.broker_identity_digest,
+                )
+            except ExecutionIndeterminate:
+                if existing is not None and existing["status"] in ExecutionJournal.UNRESOLVED:
+                    self.journal.set_status(request.operation_id, "INDETERMINATE")
+                raise
             blockers = self.journal.unresolved_other_than(request.operation_id)
             if blockers:
                 raise GatewayBusy(
