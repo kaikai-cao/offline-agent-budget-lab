@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import json
 import os
@@ -9,6 +10,7 @@ import subprocess
 import sys
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -144,7 +146,8 @@ class ExecutionBindingTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def make_grant(self, *, quota: int, allowed_tool_name: str = "invoice_review",
-                   allowed_schema_hash: str | None = None):
+                   allowed_schema_hash: str | None = None,
+                   audience: str = "gateway-lab-1"):
         if allowed_schema_hash is None:
             if allowed_tool_name == "invoice_review":
                 allowed_schema_hash = schema_hash(self.TOOL_SCHEMA)
@@ -156,7 +159,7 @@ class ExecutionBindingTests(unittest.TestCase):
             grant_id="grant-2026-001",
             lease_id="lease-offline-17",
             subject_id="agent-17",
-            audience="gateway-lab-1",
+            audience=audience,
             context_digest=context_hash(self.CONTEXT),
             issued_at=self.NOW - 60,
             expires_at=self.NOW + 3600,
@@ -943,7 +946,8 @@ print(json.dumps(outcome.receipt, sort_keys=True))
 
 
     def _d71_gateway_at(
-        self, root, tool, clock, *, gateway_private_key=None
+        self, root, tool, clock, *, gateway_private_key=None,
+        gateway_id="gateway-lab-1", lock_name="gateway.lock"
     ):
         broker = DurableCounterBroker(
             journal_path=root / "budget-journal.sqlite3",
@@ -958,10 +962,10 @@ print(json.dumps(outcome.receipt, sort_keys=True))
                 self.gateway_private
                 if gateway_private_key is None else gateway_private_key
             ),
-            gateway_id="gateway-lab-1",
+            gateway_id=gateway_id,
             broker=broker,
             journal_path=root / "execution-journal.sqlite3",
-            lock_path=root / "gateway.lock",
+            lock_path=root / lock_name,
             tools={tool.tool_name: tool},
             clock=clock,
         )
@@ -1385,6 +1389,155 @@ print(json.dumps(outcome.receipt, sort_keys=True))
         self.assertEqual(tool.lookup_calls, 1)
         self.assertEqual(tool.effects, 1)
         self.assertEqual(restarted.broker.counter.read(), 1)
+
+
+    def test_d74_same_identity_can_reuse_journal_for_new_operations(self):
+        root, tool, request, grant, gateway, now = self._d71_case(
+            retention_seconds=10
+        )
+        gateway.execute(grant, request)
+        second_request = replace(request, operation_id="op-d74-second")
+        second = gateway.execute(grant, second_request)
+
+        self.assertFalse(second.replayed)
+        self.assertEqual(tool.effects, 2)
+        self.assertEqual(gateway.broker.counter.read(), 2)
+        with closing(sqlite3.connect(root / "execution-journal.sqlite3")) as con:
+            row = con.execute(
+                "SELECT gateway_id,gateway_public_key_digest "
+                "FROM gateway_identity WHERE singleton_id=1"
+            ).fetchone()
+        self.assertEqual(row, (gateway.gateway_id, gateway.gateway_public_key_digest))
+
+    def test_d74_different_signing_key_rejected_across_new_operation(self):
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+        root, tool, request, grant, gateway, now = self._d71_case(
+            retention_seconds=10
+        )
+        gateway.execute(grant, request)
+        new_request = replace(request, operation_id="op-d74-key-rotation")
+        other = self._d71_gateway_at(
+            root, tool, lambda: now[0],
+            gateway_private_key=Ed25519PrivateKey.generate(),
+            lock_name="gateway-other.lock",
+        )
+
+        with self.assertRaises(ExecutionIndeterminate):
+            other.execute(grant, new_request)
+
+        self.assertEqual(tool.lookup_calls, 1)
+        self.assertEqual(tool.effects, 1)
+        self.assertEqual(other.broker.counter.read(), 1)
+        self.assertIsNone(other.journal.get(new_request.operation_id))
+
+    def test_d74_different_gateway_id_rejected_across_new_operation(self):
+        root, tool, request, grant, gateway, now = self._d71_case(
+            retention_seconds=10
+        )
+        gateway.execute(grant, request)
+        new_request = replace(request, operation_id="op-d74-gateway-id")
+        other = self._d71_gateway_at(
+            root, tool, lambda: now[0],
+            gateway_id="gateway-lab-2",
+            lock_name="gateway-other.lock",
+        )
+
+        other_grant = self.make_grant(
+            quota=5,
+            allowed_tool_name="send_message",
+            allowed_schema_hash=tool.schema_hash,
+            audience="gateway-lab-2",
+        )
+        with self.assertRaises(ExecutionIndeterminate):
+            other.execute(other_grant, new_request)
+
+        self.assertEqual(tool.lookup_calls, 1)
+        self.assertEqual(tool.effects, 1)
+        self.assertEqual(other.broker.counter.read(), 1)
+        self.assertIsNone(other.journal.get(new_request.operation_id))
+
+    def test_d74_competing_first_identity_bindings_are_serialized(self):
+        tmp = tempfile.TemporaryDirectory(prefix="d74-race-")
+        self.addCleanup(tmp.cleanup)
+        db = Path(tmp.name) / "execution-journal.sqlite3"
+        first = ExecutionJournal(db)
+        second = ExecutionJournal(db)
+        barrier = threading.Barrier(2)
+
+        identities = [
+            ("gateway-race-A", "sha256:" + "a" * 64),
+            ("gateway-race-B", "sha256:" + "b" * 64),
+        ]
+
+        def attempt(journal, identity):
+            barrier.wait(timeout=10)
+            try:
+                journal.bind_gateway_identity(*identity)
+                return (identity, "bound")
+            except ExecutionIndeterminate:
+                return (identity, "rejected")
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(
+                lambda item: attempt(item[0], item[1]),
+                [(first, identities[0]), (second, identities[1])],
+            ))
+
+        self.assertEqual(sorted(result for _, result in results), ["bound", "rejected"])
+        with closing(sqlite3.connect(db)) as con:
+            stored = con.execute(
+                "SELECT gateway_id,gateway_public_key_digest "
+                "FROM gateway_identity WHERE singleton_id=1"
+            ).fetchone()
+        self.assertIn(tuple(stored), identities)
+
+    def test_d74_d73_rows_bootstrap_global_identity_registry(self):
+        tmp = tempfile.TemporaryDirectory(prefix="d74-bootstrap-")
+        self.addCleanup(tmp.cleanup)
+        db = Path(tmp.name) / "d73-journal.sqlite3"
+        identity = ("gateway-lab-1", "sha256:" + "c" * 64)
+
+        con = sqlite3.connect(db)
+        try:
+            con.execute(
+                "CREATE TABLE executions ("
+                "operation_id TEXT PRIMARY KEY, grant_digest TEXT NOT NULL, "
+                "grant_id TEXT NOT NULL, lease_id TEXT NOT NULL, "
+                "subject_id TEXT NOT NULL, tool_name TEXT NOT NULL, "
+                "schema_hash TEXT NOT NULL, context_digest TEXT NOT NULL, "
+                "request_digest TEXT NOT NULL, status TEXT NOT NULL, "
+                "budget_counter_value INTEGER, receipt_json TEXT, "
+                "parent_authorization_digest TEXT NOT NULL DEFAULT '', "
+                "parent_authorization_nonce TEXT NOT NULL DEFAULT '', "
+                "dispatch_started_at INTEGER, tool_capabilities_digest TEXT, "
+                "gateway_id TEXT, gateway_public_key_digest TEXT, "
+                "updated_utc TEXT NOT NULL DEFAULT "
+                "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+                ")"
+            )
+            con.execute(
+                "INSERT INTO executions(operation_id,grant_digest,grant_id,lease_id,"
+                "subject_id,tool_name,schema_hash,context_digest,request_digest,status,"
+                "gateway_id,gateway_public_key_digest) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    "legacy-d73", "gd", "gid", "lid", "sid", "tool", "sh",
+                    "cd", "rd", "COMMITTED", identity[0], identity[1],
+                ),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+        journal = ExecutionJournal(db)
+        journal.bind_gateway_identity(*identity)
+        with closing(sqlite3.connect(db)) as con:
+            stored = con.execute(
+                "SELECT gateway_id,gateway_public_key_digest "
+                "FROM gateway_identity WHERE singleton_id=1"
+            ).fetchone()
+        self.assertEqual(stored, identity)
 
 
 if __name__ == "__main__":

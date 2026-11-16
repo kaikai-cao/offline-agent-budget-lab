@@ -633,6 +633,74 @@ class ExecutionJournal:
                 "ON executions(parent_authorization_digest) "
                 "WHERE parent_authorization_digest <> ''"
             )
+            con.execute(
+                "CREATE TABLE IF NOT EXISTS gateway_identity ("
+                "singleton_id INTEGER PRIMARY KEY CHECK(singleton_id=1), "
+                "gateway_id TEXT NOT NULL, "
+                "gateway_public_key_digest TEXT NOT NULL, "
+                "created_utc TEXT NOT NULL DEFAULT "
+                "(strftime('%Y-%m-%dT%H:%M:%fZ','now')))"
+            )
+
+    def bind_gateway_identity(
+        self, gateway_id: str, gateway_public_key_digest: str
+    ) -> None:
+        """Pin this execution journal to exactly one Gateway identity.
+
+        BEGIN IMMEDIATE serializes competing first-writer attempts even when
+        Gateway instances were configured with different lock-file paths.
+        Existing D7.3 rows can bootstrap the registry if their identity is
+        complete and consistent. Legacy rows with no identity are not adopted.
+        """
+        if not isinstance(gateway_id, str) or not gateway_id.strip():
+            raise ValueError("gateway_id must be a non-empty string")
+        if (
+            not isinstance(gateway_public_key_digest, str)
+            or len(gateway_public_key_digest) != 71
+            or not gateway_public_key_digest.startswith("sha256:")
+            or any(c not in "0123456789abcdef" for c in gateway_public_key_digest[7:])
+        ):
+            raise ValueError("gateway_public_key_digest must be a sha256 digest")
+
+        identity = (gateway_id, gateway_public_key_digest)
+        with _ClosingConnection(self.path) as con:
+            con.execute("BEGIN IMMEDIATE")
+            stored = con.execute(
+                "SELECT gateway_id,gateway_public_key_digest "
+                "FROM gateway_identity WHERE singleton_id=1"
+            ).fetchone()
+            if stored is not None:
+                if tuple(stored) != identity:
+                    raise ExecutionIndeterminate(
+                        "execution journal is already bound to a different Gateway identity"
+                    )
+                con.commit()
+                return
+
+            # Bootstrap an upgraded D7.3 database from its existing per-row
+            # identity snapshots. Incomplete or conflicting snapshots fail closed.
+            legacy = con.execute(
+                "SELECT DISTINCT gateway_id,gateway_public_key_digest "
+                "FROM executions "
+                "WHERE gateway_id IS NOT NULL OR gateway_public_key_digest IS NOT NULL"
+            ).fetchall()
+            if legacy:
+                if len(legacy) != 1 or legacy[0][0] is None or legacy[0][1] is None:
+                    raise ExecutionIndeterminate(
+                        "legacy execution journal contains incomplete or conflicting Gateway identities"
+                    )
+                if tuple(legacy[0]) != identity:
+                    raise ExecutionIndeterminate(
+                        "requested Gateway identity differs from the legacy journal identity"
+                    )
+
+            con.execute(
+                "INSERT INTO gateway_identity("
+                "singleton_id,gateway_id,gateway_public_key_digest"
+                ") VALUES(1,?,?)",
+                identity,
+            )
+            con.commit()
 
     def get(self, operation_id: str) -> dict[str, Any] | None:
         with _ClosingConnection(self.path) as con:
@@ -925,6 +993,11 @@ class ExecutionBindingGateway:
                 if existing["status"] == "INDETERMINATE":
                     raise ExecutionIndeterminate("operation is marked INDETERMINATE; do not replay automatically")
 
+            # First validate the operation's own persisted identity above.
+            # Then enforce the journal-wide identity before admitting new work.
+            self.journal.bind_gateway_identity(
+                self.gateway_id, self.gateway_public_key_digest
+            )
             blockers = self.journal.unresolved_other_than(request.operation_id)
             if blockers:
                 raise GatewayBusy(
