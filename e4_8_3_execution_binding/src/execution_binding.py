@@ -1052,8 +1052,6 @@ class ExecutionBindingGateway:
         now = int(self.clock())
         if now < grant.issued_at:
             raise GrantRejected("grant is not yet valid")
-        if now >= grant.expires_at:
-            raise GrantRejected("grant has expired")
         if grant.audience != self.gateway_id:
             raise GrantRejected("grant audience does not match this gateway")
         if request.subject_id != grant.subject_id:
@@ -1130,6 +1128,18 @@ class ExecutionBindingGateway:
         if budget_binding is not None:
             digest_material["global_budget_binding"] = dict(budget_binding)
         request_digest = "sha256:" + sha256_hex(digest_material)
+        if budget_binding is not None:
+            authorize_operation = getattr(self.broker, "authorize_execution_operation", None)
+            if callable(authorize_operation):
+                authorize_operation(
+                    grant,
+                    operation_id=request.operation_id,
+                    request_digest=request_digest,
+                )
+            elif now >= grant.expires_at:
+                raise GrantRejected("grant has expired")
+        elif now >= grant.expires_at:
+            raise GrantRejected("grant has expired")
         return tool, context_digest, request_digest, budget_binding
 
     def execute(
@@ -1315,6 +1325,10 @@ class ExecutionBindingGateway:
                 if not receipt_binding_ok:
                     self.journal.set_status(request.operation_id, "INDETERMINATE")
                     raise ExecutionIndeterminate("Broker returned a receipt with mismatched bindings")
+                if crash_at == "after_budget_allocation":
+                    raise InjectedCrash(
+                        "crash after durable Broker allocation and before Gateway receipt persistence"
+                    )
                 self.journal.set_budget_consumed(
                     request.operation_id,
                     counter_value,
@@ -1348,10 +1362,6 @@ class ExecutionBindingGateway:
                         "global_sequence": global_sequence,
                         "lease_used_count": lease_used_count,
                     }
-                if crash_at == "after_budget_allocation":
-                    raise InjectedCrash("crash after durable broker allocation and before gateway journal update")
-                self.journal.set_budget_consumed(request.operation_id, budget_receipt.counter_value)
-                existing = self.journal.get(request.operation_id)
 
             dispatch_started_now = False
             if existing["status"] == "BUDGET_CONSUMED":

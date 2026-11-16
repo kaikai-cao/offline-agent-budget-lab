@@ -158,8 +158,10 @@ class GlobalBudgetExecutionAdapter:
         # Registration is idempotent for the exact signed Grant. It is performed
         # here as an explicit control-plane step, never during tool execution.
         lease = self.global_broker.register_lease(global_lease_grant)
-        if lease["grant_digest"] != global_lease_grant.grant_digest or lease["state"] != "ACTIVE":
-            raise ExecutionGrantRejected("Global Lease is not active after registration")
+        if lease["grant_digest"] != global_lease_grant.grant_digest:
+            raise ExecutionGrantRejected("Global Lease is not bound to the supplied signed Grant")
+        if lease["state"] not in {"ACTIVE", "EXPIRED", "REVOKED"}:
+            raise ExecutionGrantRejected("Global Lease has an unsupported ledger state")
 
         execution_digest = execution_grant.grant_digest
         with self._lock:
@@ -181,14 +183,48 @@ class GlobalBudgetExecutionAdapter:
         lease = self.global_broker.journal.get_lease(global_grant.lease_id)
         if lease is None or lease["grant_digest"] != global_grant.grant_digest:
             raise ExecutionGrantRejected("Global Lease is not registered in the shared budget ledger")
-        if lease["state"] != "ACTIVE":
-            raise ExecutionGrantRejected(f"Global Lease is not active: {lease['state']}")
-        if int(self.global_broker.clock()) >= int(lease["expires_at"]):
-            raise ExecutionGrantRejected("Global Lease has expired")
         return {
             "global_budget_id": global_grant.global_budget_id,
             "global_lease_grant_digest": global_grant.grant_digest,
         }
+
+    def authorize_execution_operation(
+        self,
+        execution_grant: Any,
+        *,
+        operation_id: str,
+        request_digest: str,
+    ) -> None:
+        """Allow new work only on an active Lease; inactive Leases may settle an exact durable operation."""
+        self.binding_for_execution_grant(execution_grant)
+        with self._lock:
+            pair = self._bindings.get(execution_grant.grant_digest)
+        if pair is None:
+            raise ExecutionGrantRejected("execution Grant lost its Global Lease binding")
+        global_grant = pair[1]
+        lease = self.global_broker.journal.get_lease(global_grant.lease_id)
+        if lease is None or lease["grant_digest"] != global_grant.grant_digest:
+            raise ExecutionGrantRejected("Global Lease binding is missing or changed")
+
+        now = int(self.global_broker.clock())
+        if lease["state"] == "ACTIVE" and now < int(lease["expires_at"]):
+            return
+
+        # Expiry/revocation is not a reason to strand a previously authorized
+        # increment. Only the exact durable Broker intent/receipt may be settled.
+        operation = self.global_broker.journal.get_operation(operation_id)
+        if operation is not None:
+            expected = (global_grant.lease_id, global_grant.grant_digest, request_digest)
+            actual = (
+                operation["lease_id"], operation["grant_digest"], operation["request_digest"]
+            )
+            if actual == expected and operation["status"] in {"PENDING", "COMMITTED"}:
+                return
+
+        reason = "revoked" if lease["state"] == "REVOKED" else "expired or inactive"
+        raise ExecutionGrantRejected(
+            f"Global Lease is {reason}; only an exact pending/committed operation may be recovered"
+        )
 
     def consume_for_grant(
         self,
@@ -197,7 +233,11 @@ class GlobalBudgetExecutionAdapter:
         operation_id: str,
         request_digest: str,
     ) -> GlobalBudgetExecutionReceipt:
-        self.binding_for_execution_grant(execution_grant)
+        self.authorize_execution_operation(
+            execution_grant,
+            operation_id=operation_id,
+            request_digest=request_digest,
+        )
         with self._lock:
             pair = self._bindings.get(execution_grant.grant_digest)
         if pair is None:
