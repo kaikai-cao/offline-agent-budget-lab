@@ -21,6 +21,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
     Ed25519PublicKey,
 )
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 from src.durable_broker import (
     BrokerIndeterminate,
@@ -587,6 +588,8 @@ class ExecutionJournal:
                 "parent_authorization_nonce TEXT NOT NULL DEFAULT '', "
                 "dispatch_started_at INTEGER, "
                 "tool_capabilities_digest TEXT, "
+                "gateway_id TEXT, "
+                "gateway_public_key_digest TEXT, "
                 "updated_utc TEXT NOT NULL DEFAULT "
                 "(strftime('%Y-%m-%dT%H:%M:%fZ','now')))"
             )
@@ -612,6 +615,14 @@ class ExecutionJournal:
                 con.execute(
                     "ALTER TABLE executions ADD COLUMN tool_capabilities_digest TEXT"
                 )
+            if "gateway_id" not in columns:
+                con.execute(
+                    "ALTER TABLE executions ADD COLUMN gateway_id TEXT"
+                )
+            if "gateway_public_key_digest" not in columns:
+                con.execute(
+                    "ALTER TABLE executions ADD COLUMN gateway_public_key_digest TEXT"
+                )
             con.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS ux_executions_parent_nonce "
                 "ON executions(parent_authorization_nonce) "
@@ -629,14 +640,16 @@ class ExecutionJournal:
                 "SELECT operation_id,grant_digest,grant_id,lease_id,subject_id,tool_name,"
                 "schema_hash,context_digest,request_digest,status,budget_counter_value,receipt_json,"
                 "parent_authorization_digest,parent_authorization_nonce,dispatch_started_at,"
-                "tool_capabilities_digest FROM executions WHERE operation_id=?", (operation_id,)
+                "tool_capabilities_digest,gateway_id,gateway_public_key_digest "
+                "FROM executions WHERE operation_id=?", (operation_id,)
             ).fetchone()
         if row is None:
             return None
         keys = ("operation_id", "grant_digest", "grant_id", "lease_id", "subject_id",
                 "tool_name", "schema_hash", "context_digest", "request_digest", "status",
                 "budget_counter_value", "receipt_json", "parent_authorization_digest",
-                "parent_authorization_nonce", "dispatch_started_at", "tool_capabilities_digest")
+                "parent_authorization_nonce", "dispatch_started_at", "tool_capabilities_digest",
+                "gateway_id", "gateway_public_key_digest")
         return dict(zip(keys, row))
 
     def unresolved_other_than(self, operation_id: str) -> list[str]:
@@ -655,13 +668,16 @@ class ExecutionJournal:
                 con.execute(
                     "INSERT INTO executions(operation_id,grant_digest,grant_id,lease_id,subject_id,"
                     "tool_name,schema_hash,context_digest,request_digest,status,"
-                    "parent_authorization_digest,parent_authorization_nonce) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,'ALLOCATING',?,?)",
+                    "parent_authorization_digest,parent_authorization_nonce,gateway_id,"
+                    "gateway_public_key_digest) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,'ALLOCATING',?,?,?,?)",
                     (record["operation_id"], record["grant_digest"], record["grant_id"],
                      record["lease_id"], record["subject_id"], record["tool_name"],
                      record["schema_hash"], record["context_digest"], record["request_digest"],
                      record.get("parent_authorization_digest", ""),
-                     record.get("parent_authorization_nonce", "")),
+                     record.get("parent_authorization_nonce", ""),
+                     record.get("gateway_id"),
+                     record.get("gateway_public_key_digest")),
                 )
             except sqlite3.IntegrityError as exc:
                 parent_nonce = record.get("parent_authorization_nonce", "")
@@ -779,6 +795,11 @@ class ExecutionBindingGateway:
         self.issuer_public_key = issuer_public_key
         self.gateway_private_key = gateway_private_key
         self.gateway_public_key = gateway_private_key.public_key()
+        self.gateway_public_key_digest = (
+            "sha256:" + hashlib.sha256(
+                self.gateway_public_key.public_bytes(Encoding.Raw, PublicFormat.Raw)
+            ).hexdigest()
+        )
         self.gateway_id = gateway_id
         self.broker = broker
         self.journal = ExecutionJournal(journal_path)
@@ -860,13 +881,37 @@ class ExecutionBindingGateway:
             "request_digest": request_digest,
             "parent_authorization_digest": grant.parent_authorization_digest,
             "parent_authorization_nonce": grant.parent_authorization_nonce,
+            "gateway_id": self.gateway_id,
+            "gateway_public_key_digest": self.gateway_public_key_digest,
         }
 
         with CrossProcessFileLock(self.lock_path):
             existing = self.journal.get(request.operation_id)
             if existing is not None:
+                identity_fields = ("gateway_id", "gateway_public_key_digest")
+                missing_identity = [
+                    field for field in identity_fields if not existing.get(field)
+                ]
+                if missing_identity:
+                    if existing["status"] in ExecutionJournal.UNRESOLVED:
+                        self.journal.set_status(
+                            request.operation_id, "INDETERMINATE"
+                        )
+                    raise ExecutionIndeterminate(
+                        "execution record has no persisted Gateway identity"
+                    )
+
                 for field in record:
                     if existing[field] != record[field]:
+                        if field in identity_fields:
+                            if existing["status"] in ExecutionJournal.UNRESOLVED:
+                                self.journal.set_status(
+                                    request.operation_id, "INDETERMINATE"
+                                )
+                            raise ExecutionIndeterminate(
+                                "Gateway identity or signing key differs from "
+                                "the identity bound to this execution"
+                            )
                         raise OperationBindingConflict(
                             f"operation_id is already bound to a different {field}"
                         )

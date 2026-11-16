@@ -942,7 +942,9 @@ print(json.dumps(outcome.receipt, sort_keys=True))
             self.assertEqual(tool.effect_count(), 1)
 
 
-    def _d71_gateway_at(self, root, tool, clock):
+    def _d71_gateway_at(
+        self, root, tool, clock, *, gateway_private_key=None
+    ):
         broker = DurableCounterBroker(
             journal_path=root / "budget-journal.sqlite3",
             counter_state_path=root / "counter.json",
@@ -952,7 +954,10 @@ print(json.dumps(outcome.receipt, sort_keys=True))
         )
         return ExecutionBindingGateway(
             issuer_public_key=self.issuer_private.public_key(),
-            gateway_private_key=self.gateway_private,
+            gateway_private_key=(
+                self.gateway_private
+                if gateway_private_key is None else gateway_private_key
+            ),
             gateway_id="gateway-lab-1",
             broker=broker,
             journal_path=root / "execution-journal.sqlite3",
@@ -1171,6 +1176,8 @@ print(json.dumps(outcome.receipt, sort_keys=True))
         self.assertEqual(row["budget_counter_value"], 1)
         self.assertIsNone(row["dispatch_started_at"])
         self.assertIsNone(row["tool_capabilities_digest"])
+        self.assertIsNone(row["gateway_id"])
+        self.assertIsNone(row["gateway_public_key_digest"])
 
 
     def test_d72_dispatch_persists_capability_contract_before_lookup(self):
@@ -1286,6 +1293,98 @@ print(json.dumps(outcome.receipt, sort_keys=True))
         self.assertEqual(row["status"], "DISPATCHING")
         self.assertEqual(row["dispatch_started_at"], self.NOW)
         self.assertIsNone(row["tool_capabilities_digest"])
+        self.assertIsNone(row["gateway_id"])
+        self.assertIsNone(row["gateway_public_key_digest"])
+
+
+    def test_d73_gateway_identity_is_persisted_before_dispatch(self):
+        root, tool, request, grant, gateway, now = self._d71_case(
+            retention_seconds=10
+        )
+        row = gateway.journal.get(request.operation_id)
+        self.assertEqual(row["gateway_id"], gateway.gateway_id)
+        self.assertEqual(
+            row["gateway_public_key_digest"],
+            gateway.gateway_public_key_digest,
+        )
+        self.assertRegex(
+            row["gateway_public_key_digest"], r"^sha256:[0-9a-f]{64}$"
+        )
+        self.assertEqual(tool.lookup_calls, 0)
+
+        restarted = self._d71_gateway_at(root, tool, lambda: now[0])
+        restarted.execute(grant, request)
+        self.assertEqual(tool.effects, 1)
+        self.assertEqual(restarted.broker.counter.read(), 1)
+
+    def test_d73_signing_key_rotation_fails_closed_before_lookup(self):
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+        root, tool, request, grant, gateway, now = self._d71_case(
+            retention_seconds=10
+        )
+        rotated_key = Ed25519PrivateKey.generate()
+        restarted = self._d71_gateway_at(
+            root, tool, lambda: now[0], gateway_private_key=rotated_key
+        )
+        with self.assertRaises(ExecutionIndeterminate):
+            restarted.execute(grant, request)
+
+        self.assertEqual(tool.lookup_calls, 0)
+        self.assertEqual(tool.effects, 0)
+        self.assertEqual(restarted.broker.counter.read(), 1)
+        self.assertEqual(
+            restarted.journal.get(request.operation_id)["status"],
+            "INDETERMINATE",
+        )
+
+    def test_d73_missing_gateway_identity_snapshot_fails_closed(self):
+        root, tool, request, grant, gateway, now = self._d71_case(
+            retention_seconds=10
+        )
+        con = sqlite3.connect(root / "execution-journal.sqlite3")
+        try:
+            con.execute(
+                "UPDATE executions SET gateway_id=NULL, "
+                "gateway_public_key_digest=NULL WHERE operation_id=?",
+                (request.operation_id,),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+        restarted = self._d71_gateway_at(root, tool, lambda: now[0])
+        with self.assertRaises(ExecutionIndeterminate):
+            restarted.execute(grant, request)
+
+        self.assertEqual(tool.lookup_calls, 0)
+        self.assertEqual(tool.effects, 0)
+        self.assertEqual(restarted.broker.counter.read(), 1)
+        self.assertEqual(
+            restarted.journal.get(request.operation_id)["status"],
+            "INDETERMINATE",
+        )
+
+    def test_d73_changed_signing_key_cannot_replay_committed_receipt(self):
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+        root, tool, request, grant, gateway, now = self._d71_case(
+            retention_seconds=10
+        )
+        gateway.execute(grant, request)
+        self.assertEqual(tool.effects, 1)
+        self.assertEqual(tool.lookup_calls, 1)
+
+        rotated_key = Ed25519PrivateKey.generate()
+        restarted = self._d71_gateway_at(
+            root, tool, lambda: now[0], gateway_private_key=rotated_key
+        )
+        with self.assertRaises(ExecutionIndeterminate):
+            restarted.execute(grant, request)
+
+        self.assertEqual(tool.lookup_calls, 1)
+        self.assertEqual(tool.effects, 1)
+        self.assertEqual(restarted.broker.counter.read(), 1)
 
 
 if __name__ == "__main__":
