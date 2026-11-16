@@ -1,6 +1,6 @@
 # E4.8.4 — Multi-Lease Global Budget Broker (D8.1)
 
-**Status:** D8.1 standalone software model; D8.2 Gateway integration is not included.
+**Status:** D8.1 standalone Broker; D8.2 E4.8.3 Gateway integration and D8.3 adversarial validation are complete. D8.4 freezes the offline software-model baseline.
 **Hardware:** none. This package does not call TBS/TPM APIs, access a TPM, or perform NV writes.
 
 ## Objective
@@ -36,7 +36,10 @@ e4_8_4_multi_lease_budget/
 ├── examples/
 │   └── multi_lease_demo.py
 └── docs/
-    └── D8.0_MULTI_LEASE_GLOBAL_BUDGET_DESIGN.md
+    ├── D8.0_MULTI_LEASE_GLOBAL_BUDGET_DESIGN.md
+    ├── D8.2_EXECUTION_BINDING_INTEGRATION.md
+    ├── D8.3_ADVERSARIAL_VALIDATION.md
+    └── D8.4_OFFLINE_GLOBAL_BUDGET_FREEZE.md
 ```
 
 ## Run on Windows PowerShell
@@ -166,5 +169,5 @@ The 39 tests cover:
 - The counter is a JSON-file emulator, not a TPM NV Counter. File locks model host-local serialization only.
 - No multi-host consensus, distributed lock service, TEE isolation, TPM attestation, power-loss/storage-controller durability guarantee or malicious administrator resistance.
 - The Issuer/Gateway private-key lifecycle and Online revocation delivery are not productionized.
-- D8.1 does not integrate the E4.8.3 Gateway. That is D8.2.
+- D8.1 provides the standalone Global Budget Broker; D8.2 adds the E4.8.3 adapter while retaining the legacy single-Lease path. D8.3 validates the integrated boundary. See the D8.4 freeze record for the accepted offline baseline.
 - Passing tests validates only this software model and the enumerated crash/concurrency cases. It is not a formal proof or production security certification.

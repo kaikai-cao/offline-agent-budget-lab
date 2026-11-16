@@ -2,7 +2,7 @@
 
 **阶段目标：** 将签名 Lease Grant、离线预算序号、精确工具请求、工具 Schema Hash 与执行回执绑定为一条可验证链。
 
-**安全边界：纯软件模型。** 本包不调用 TBS、不连接 TPM、不发送 TPM 命令、不修改 E4.7.3，也不修改现有 `agent-exec-binding-mvp`。计数器层复用 E4.8.2 的文件模拟器和 SQLite Durable Broker。所有硬件信任结论仍待后续单独验证。
+**安全边界：纯软件模型。** 本包不调用 TBS、不连接 TPM、不发送 TPM 命令、不修改 E4.7.3，也不修改现有 `agent-exec-binding-mvp`。支持两种预算路径：保留 E4.8.2 的单 Lease Durable Broker 路径；另由 `src/global_budget_adapter.py` 接入 E4.8.4 的 Multi-Lease Global Budget Broker。多 Lease 路径仍使用单机共享 SQLite Journal、JSON 文件计数器和文件锁，不代表真实 TPM 或多主机能力。
 
 ## 运行环境
 
@@ -38,6 +38,8 @@ python -m unittest discover -s tests -v
 - 请求参数或 Operation ID 绑定变化被拒绝。
 - 执行回执签名与结果摘要校验；篡改回执后验签失败。
 - 多个操作取得不同预算序号；同一操作重放不重复消费。
+- D8.2 将多个签名 Execution Lease Grant 绑定到 E4.8.4 的签名 Global Lease Grant，并共享全局序号。
+- D8.3 覆盖跨 Lease operation ID 竞争、单 Lease 额度耗尽隔离、Gateway 重启回执恢复，以及撤销/过期后的精确操作恢复。
 - 两个独立进程并发提交同一 Operation ID，共享一张签名回执和一次工具效果。
 - 预算分配后、Dispatch Intent 后、工具效果后、Receipt Commit 后的崩溃恢复。
 - 外部工具具备 operation_id 幂等能力时，可安全恢复；不具备幂等/状态查询能力时，进入 `INDETERMINATE`，不自动重复调用。
@@ -61,7 +63,7 @@ ALLOCATING
 
 ## 重要限制
 
-- Broker 每个实例仍是 E4.8.2 的单 Lease 模型；一个 Grant 的 `lease_id` 和 `quota_limit` 必须与 Broker 配置一致。还没有多租约共享一个 TPM Counter 的额度分片协议。
+- 旧版 `DurableCounterBroker` 路径仍然是单 Lease。多 Lease 路径由 E4.8.4 `GlobalBudgetBroker` 和 `GlobalBudgetExecutionAdapter` 提供：每个 Execution Grant 必须与同一 Issuer 签发的 Global Lease Grant 精确配对；所有参与者共享同一全局 Journal、JSON Counter、Counter Lock 和 Broker Lock。该路径不是 TPM Counter 分片或硬件实现。
 - Ed25519 私钥在测试中由进程临时生成。实际部署必须把 Issuer/Gateway 密钥放进独立可信密钥管理边界，并稳定管理轮换和公钥信任根。
 - 执行回执是 Gateway 对 Broker 结果和工具结果的签名陈述；它不是 TPM 对某条 NV_Increment 命令的直接密码学证明。
 - SQLite 执行账本、模拟器 Counter 文件和 Tool Adapter 测试数据库均为软件状态。当前模型不抵御管理员替换程序、回滚/篡改全部本地文件、内核攻击或跨主机克隆。
