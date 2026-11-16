@@ -68,6 +68,7 @@ class D63ScriptedLookupTool(NonIdempotentTool):
         result=None,
         retention_seconds=None,
         naturally_idempotent=False,
+        idempotency_scope=None,
     ):
         super().__init__()
         from src.execution_binding import (
@@ -81,7 +82,9 @@ class D63ScriptedLookupTool(NonIdempotentTool):
         self._supports_idempotency_key = supports_idempotency_key
         self._retention_seconds = retention_seconds
         self._naturally_idempotent = naturally_idempotent
+        self._idempotency_scope = idempotency_scope
         self._lookup_result = result
+        self.lookup_calls = 0
         self._ToolCapabilities = ToolCapabilities
         self._ToolLookupResult = ToolLookupResult
 
@@ -92,9 +95,11 @@ class D63ScriptedLookupTool(NonIdempotentTool):
             supports_idempotency_key=self._supports_idempotency_key,
             supports_authoritative_lookup=self._declares_authoritative,
             idempotency_retention_seconds=self._retention_seconds,
+            idempotency_scope=self._idempotency_scope,
         )
 
     def lookup(self, *, operation_id, request_digest):
+        self.lookup_calls += 1
         return self._ToolLookupResult(
             status=self._status,
             operation_id=operation_id,
@@ -956,7 +961,10 @@ print(json.dumps(outcome.receipt, sort_keys=True))
             clock=clock,
         )
 
-    def _d71_case(self, *, retention_seconds=10, naturally_idempotent=False):
+    def _d71_case(
+        self, *, retention_seconds=10, naturally_idempotent=False,
+        idempotency_scope="mock-send-message-tenant-A",
+    ):
         from src.execution_binding import ToolLookupStatus
 
         tmp = tempfile.TemporaryDirectory(prefix="d71-case-")
@@ -968,6 +976,7 @@ print(json.dumps(outcome.receipt, sort_keys=True))
             supports_idempotency_key=True,
             retention_seconds=retention_seconds,
             naturally_idempotent=naturally_idempotent,
+            idempotency_scope=idempotency_scope,
         )
 
         request = ToolRequest(
@@ -1112,7 +1121,9 @@ print(json.dumps(outcome.receipt, sort_keys=True))
             retention_seconds=10
         )
         original = gateway.journal.get(request.operation_id)["dispatch_started_at"]
-        gateway.journal.set_dispatching(request.operation_id, self.NOW + 5)
+        gateway.journal.set_dispatching(
+            request.operation_id, self.NOW + 5, "sha256:" + "b" * 64
+        )
         self.assertEqual(
             gateway.journal.get(request.operation_id)["dispatch_started_at"],
             original,
@@ -1159,6 +1170,122 @@ print(json.dumps(outcome.receipt, sort_keys=True))
         self.assertEqual(row["status"], "DISPATCHING")
         self.assertEqual(row["budget_counter_value"], 1)
         self.assertIsNone(row["dispatch_started_at"])
+        self.assertIsNone(row["tool_capabilities_digest"])
+
+
+    def test_d72_dispatch_persists_capability_contract_before_lookup(self):
+        root, tool, request, grant, gateway, now = self._d71_case(
+            retention_seconds=10
+        )
+        row = gateway.journal.get(request.operation_id)
+        digest = row["tool_capabilities_digest"]
+        self.assertRegex(digest, r"^sha256:[0-9a-f]{64}$")
+        self.assertEqual(tool.lookup_calls, 0)
+
+        restarted = self._d71_gateway_at(root, tool, lambda: now[0])
+        restarted.execute(grant, request)
+        self.assertEqual(tool.lookup_calls, 1)
+        self.assertEqual(tool.effects, 1)
+        self.assertEqual(restarted.broker.counter.read(), 1)
+
+    def test_d72_retention_contract_drift_fails_closed_before_lookup(self):
+        root, tool, request, grant, gateway, now = self._d71_case(
+            retention_seconds=10
+        )
+        self.assertIsNotNone(
+            gateway.journal.get(request.operation_id)["tool_capabilities_digest"]
+        )
+        tool._retention_seconds = 11
+
+        restarted = self._d71_gateway_at(root, tool, lambda: now[0])
+        with self.assertRaises(ExecutionIndeterminate):
+            restarted.execute(grant, request)
+
+        self.assertEqual(tool.lookup_calls, 0)
+        self.assertEqual(tool.effects, 0)
+        self.assertEqual(restarted.broker.counter.read(), 1)
+        self.assertEqual(
+            restarted.journal.get(request.operation_id)["status"],
+            "INDETERMINATE",
+        )
+
+    def test_d72_idempotency_scope_drift_fails_closed_before_lookup(self):
+        root, tool, request, grant, gateway, now = self._d71_case(
+            retention_seconds=10
+        )
+        tool._idempotency_scope = "mock-send-message-tenant-B"
+
+        restarted = self._d71_gateway_at(root, tool, lambda: now[0])
+        with self.assertRaises(ExecutionIndeterminate):
+            restarted.execute(grant, request)
+
+        self.assertEqual(tool.lookup_calls, 0)
+        self.assertEqual(tool.effects, 0)
+        self.assertEqual(restarted.broker.counter.read(), 1)
+
+    def test_d72_missing_capability_snapshot_fails_closed(self):
+        root, tool, request, grant, gateway, now = self._d71_case(
+            retention_seconds=10
+        )
+        con = sqlite3.connect(root / "execution-journal.sqlite3")
+        try:
+            con.execute(
+                "UPDATE executions SET tool_capabilities_digest=NULL WHERE operation_id=?",
+                (request.operation_id,),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+        restarted = self._d71_gateway_at(root, tool, lambda: now[0])
+        with self.assertRaises(ExecutionIndeterminate):
+            restarted.execute(grant, request)
+
+        self.assertEqual(tool.lookup_calls, 0)
+        self.assertEqual(tool.effects, 0)
+        self.assertEqual(restarted.broker.counter.read(), 1)
+
+    def test_d72_migration_preserves_d71_dispatch_timestamp(self):
+        tmp = tempfile.TemporaryDirectory(prefix="d72-migration-")
+        self.addCleanup(tmp.cleanup)
+        db = Path(tmp.name) / "d71-journal.sqlite3"
+
+        con = sqlite3.connect(db)
+        try:
+            con.execute(
+                "CREATE TABLE executions ("
+                "operation_id TEXT PRIMARY KEY, grant_digest TEXT NOT NULL, "
+                "grant_id TEXT NOT NULL, lease_id TEXT NOT NULL, "
+                "subject_id TEXT NOT NULL, tool_name TEXT NOT NULL, "
+                "schema_hash TEXT NOT NULL, context_digest TEXT NOT NULL, "
+                "request_digest TEXT NOT NULL, status TEXT NOT NULL, "
+                "budget_counter_value INTEGER, receipt_json TEXT, "
+                "parent_authorization_digest TEXT NOT NULL DEFAULT '', "
+                "parent_authorization_nonce TEXT NOT NULL DEFAULT '', "
+                "dispatch_started_at INTEGER, "
+                "updated_utc TEXT NOT NULL DEFAULT "
+                "(strftime('%Y-%m-%dT%H:%M:%fZ','now')))"
+            )
+            con.execute(
+                "INSERT INTO executions("
+                "operation_id,grant_digest,grant_id,lease_id,subject_id,"
+                "tool_name,schema_hash,context_digest,request_digest,status,"
+                "budget_counter_value,dispatch_started_at"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    "d71-existing", "gd", "gid", "lid", "sid",
+                    "tool", "sh", "cd", "rd", "DISPATCHING", 1, self.NOW,
+                ),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+        journal = ExecutionJournal(db)
+        row = journal.get("d71-existing")
+        self.assertEqual(row["status"], "DISPATCHING")
+        self.assertEqual(row["dispatch_started_at"], self.NOW)
+        self.assertIsNone(row["tool_capabilities_digest"])
 
 
 if __name__ == "__main__":

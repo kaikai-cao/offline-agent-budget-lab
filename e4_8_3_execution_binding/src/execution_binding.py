@@ -428,6 +428,33 @@ class ToolAdapter:
         raise NotImplementedError
 
 
+def _tool_recovery_contract(
+    tool: ToolAdapter,
+) -> tuple[ToolCapabilities, bool, str]:
+    """Return the current declared recovery capabilities and their stable digest."""
+    capabilities = tool.capabilities
+    if not isinstance(capabilities, ToolCapabilities):
+        raise ExecutionIndeterminate("tool capabilities contract is invalid")
+
+    legacy_idempotent = bool(
+        getattr(tool, "idempotent_by_operation_id", False)
+    )
+
+    payload = {
+        "version": 1,
+        "tool_name": tool.tool_name,
+        "schema_hash": tool.schema_hash,
+        "naturally_idempotent": capabilities.naturally_idempotent,
+        "supports_idempotency_key": capabilities.supports_idempotency_key,
+        "supports_authoritative_lookup": capabilities.supports_authoritative_lookup,
+        "idempotency_scope": capabilities.idempotency_scope,
+        "idempotency_retention_seconds": capabilities.idempotency_retention_seconds,
+        "legacy_idempotent_by_operation_id": legacy_idempotent,
+    }
+    digest = "sha256:" + sha256_hex(payload)
+    return capabilities, legacy_idempotent, digest
+
+
 class SQLiteIdempotentTool(ToolAdapter):
     """Test adapter whose idempotency/effect record survives reconstruction.
 
@@ -559,6 +586,7 @@ class ExecutionJournal:
                 "receipt_json TEXT, parent_authorization_digest TEXT NOT NULL DEFAULT '', "
                 "parent_authorization_nonce TEXT NOT NULL DEFAULT '', "
                 "dispatch_started_at INTEGER, "
+                "tool_capabilities_digest TEXT, "
                 "updated_utc TEXT NOT NULL DEFAULT "
                 "(strftime('%Y-%m-%dT%H:%M:%fZ','now')))"
             )
@@ -580,6 +608,10 @@ class ExecutionJournal:
                 con.execute(
                     "ALTER TABLE executions ADD COLUMN dispatch_started_at INTEGER"
                 )
+            if "tool_capabilities_digest" not in columns:
+                con.execute(
+                    "ALTER TABLE executions ADD COLUMN tool_capabilities_digest TEXT"
+                )
             con.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS ux_executions_parent_nonce "
                 "ON executions(parent_authorization_nonce) "
@@ -596,15 +628,15 @@ class ExecutionJournal:
             row = con.execute(
                 "SELECT operation_id,grant_digest,grant_id,lease_id,subject_id,tool_name,"
                 "schema_hash,context_digest,request_digest,status,budget_counter_value,receipt_json,"
-                "parent_authorization_digest,parent_authorization_nonce,dispatch_started_at "
-                "FROM executions WHERE operation_id=?", (operation_id,)
+                "parent_authorization_digest,parent_authorization_nonce,dispatch_started_at,"
+                "tool_capabilities_digest FROM executions WHERE operation_id=?", (operation_id,)
             ).fetchone()
         if row is None:
             return None
         keys = ("operation_id", "grant_digest", "grant_id", "lease_id", "subject_id",
                 "tool_name", "schema_hash", "context_digest", "request_digest", "status",
                 "budget_counter_value", "receipt_json", "parent_authorization_digest",
-                "parent_authorization_nonce", "dispatch_started_at")
+                "parent_authorization_nonce", "dispatch_started_at", "tool_capabilities_digest")
         return dict(zip(keys, row))
 
     def unresolved_other_than(self, operation_id: str) -> list[str]:
@@ -662,16 +694,31 @@ class ExecutionJournal:
             )
             con.commit()
 
-    def set_dispatching(self, operation_id: str, dispatch_started_at: int) -> None:
+    def set_dispatching(
+        self,
+        operation_id: str,
+        dispatch_started_at: int,
+        capabilities_digest: str,
+    ) -> None:
         if not isinstance(dispatch_started_at, int) or isinstance(dispatch_started_at, bool):
             raise ValueError("dispatch_started_at must be an integer Unix timestamp")
+        if (
+            not isinstance(capabilities_digest, str)
+            or len(capabilities_digest) != 71
+            or not capabilities_digest.startswith("sha256:")
+            or any(c not in "0123456789abcdef" for c in capabilities_digest[7:])
+        ):
+            raise ValueError("capabilities_digest must be a sha256 digest")
+
         with _ClosingConnection(self.path) as con:
             con.execute("BEGIN IMMEDIATE")
             con.execute(
                 "UPDATE executions SET status='DISPATCHING', "
                 "dispatch_started_at=COALESCE(dispatch_started_at, ?), "
-                "updated_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE operation_id=?",
-                (dispatch_started_at, operation_id),
+                "tool_capabilities_digest=COALESCE(tool_capabilities_digest, ?), "
+                "updated_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                "WHERE operation_id=? AND status='BUDGET_CONSUMED'",
+                (dispatch_started_at, capabilities_digest, operation_id),
             )
             con.commit()
 
@@ -839,6 +886,23 @@ class ExecutionBindingGateway:
                     "another operation requires recovery first: " + ",".join(blockers)
                 )
 
+            capabilities, legacy_idempotent, capabilities_digest = (
+                _tool_recovery_contract(tool)
+            )
+
+            if existing is not None and existing["status"] == "DISPATCHING":
+                persisted_digest = existing.get("tool_capabilities_digest")
+                if not persisted_digest:
+                    self.journal.set_status(request.operation_id, "INDETERMINATE")
+                    raise ExecutionIndeterminate(
+                        "DISPATCHING record has no persisted tool capability contract"
+                    )
+                if persisted_digest != capabilities_digest:
+                    self.journal.set_status(request.operation_id, "INDETERMINATE")
+                    raise ExecutionIndeterminate(
+                        "tool recovery capability contract changed after dispatch"
+                    )
+
             if existing is None:
                 self.journal.create_allocating(record)
                 existing = self.journal.get(request.operation_id)
@@ -879,7 +943,11 @@ class ExecutionBindingGateway:
 
             dispatch_started_now = False
             if existing["status"] == "BUDGET_CONSUMED":
-                self.journal.set_dispatching(request.operation_id, int(self.clock()))
+                self.journal.set_dispatching(
+                    request.operation_id,
+                    int(self.clock()),
+                    capabilities_digest,
+                )
                 existing = self.journal.get(request.operation_id)
                 dispatch_started_now = True
                 if crash_at == "after_dispatch_intent":
@@ -899,18 +967,6 @@ class ExecutionBindingGateway:
                 request_digest=request_digest,
             )
 
-            capabilities = tool.capabilities
-            if not isinstance(capabilities, ToolCapabilities):
-                raise ExecutionIndeterminate("tool capabilities contract is invalid")
-
-            legacy_idempotent = bool(
-                getattr(tool, "idempotent_by_operation_id", False)
-            )
-            idempotent_retry_allowed = (
-                capabilities.naturally_idempotent
-                or capabilities.supports_idempotency_key
-                or legacy_idempotent
-            )
             authoritative_lookup = (
                 lookup.authoritative
                 and capabilities.supports_authoritative_lookup
